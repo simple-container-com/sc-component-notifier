@@ -24,6 +24,11 @@
 //	STORAGE_PATH                     mount point for filesystem
 //	STORAGE_ACCESS_KEY / _SECRET_KEY optional; prefer the execution role
 //	PORT                             listen port            (default 8080)
+//	LOCAL_DEBUG                      "true" => serve ordinary HTTP on $PORT.
+//	                                 Anything else (including unset) means the
+//	                                 SDK calls lambda.Start and waits for the
+//	                                 Runtime API — so this must be set to run
+//	                                 the binary outside Lambda.
 //
 // Any of the secret-bearing values may arrive as a SecretsManager ARN
 // rather than a literal — see secret_resolver.go for why that is not
@@ -55,6 +60,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+
+	sdkservice "github.com/simple-container-com/go-aws-lambda-sdk/pkg/service"
 
 	"github.com/simple-container-com/sc-component-notifier/service/internal/api"
 	"github.com/simple-container-com/sc-component-notifier/service/internal/crypto"
@@ -196,29 +203,37 @@ func main() {
 		mux.Handle("/*", http.FileServer(http.FS(spaFS)))
 	}
 
-	srv := &http.Server{
-		Addr:              ":" + envOr("PORT", "8080"),
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
+	// Bridge through go-aws-lambda-sdk, the fleet pattern, rather than
+	// serving net/http directly. On Lambda the SDK calls lambda.Start,
+	// which registers with the Runtime API and adapts Function URL
+	// events onto this vanilla handler; with LOCAL_DEBUG=true it serves
+	// ordinary HTTP on $PORT instead, so one binary covers local
+	// development and the deployed artifact and the two cannot drift.
+	//
+	// This is not a refactor — it is the fix for a live failure. The
+	// first deploy of this service (2026-11-23, infra-my-notifier-
+	// callback-556b576) ran `srv.ListenAndServe()` in a goroutine and
+	// blocked on ctx.Done(). Nothing ever joined the Runtime API, so
+	// every invoke hit `platform.initReport status:timeout` after the
+	// full 30s and the Function URL answered 502 — while the boot log
+	// read perfectly: secret resolved, store built, "channel ready",
+	// "listening addr=:8080". A service that logs a clean start and
+	// cannot be invoked is the exact failure this component exists to
+	// make loud, so the lesson is in TRAPS.md too.
+	//
+	// context.Background(), NOT the signal ctx: SIGTERM cancellation is
+	// the runtime's business here, and handing a cancellable ctx to the
+	// SDK would end the process on the first signal Lambda sends during
+	// a freeze.
+	svc, err := sdkservice.New(context.Background(), sdkservice.WithVanillaHandler(mux))
+	if err != nil {
+		slog.Error("sdkservice init failed", "err", err)
+		os.Exit(1)
 	}
-
-	go func() {
-		slog.Info("listening", "addr", srv.Addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("listen failed", "err", err)
-			os.Exit(1)
-		}
-	}()
-
-	<-ctx.Done()
-	slog.Info("shutdown requested")
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer shutdownCancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		slog.Error("shutdown error", "err", err)
+	slog.Info("serving", "mode", serveMode(), "port", envOr("PORT", "8080"))
+	if err := svc.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		slog.Error("sdkservice exited", "err", err)
+		os.Exit(1)
 	}
 	slog.Info("exited cleanly")
 }
@@ -353,6 +368,22 @@ func envOr(name, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// serveMode names the branch go-aws-lambda-sdk's Start() will take, so
+// the boot log says which one happened.
+//
+// The switch is LOCAL_DEBUG, not the presence of AWS_LAMBDA_FUNCTION_NAME
+// (pkg/service/service.go:101) — worth stating, because the Lambda
+// runtime sets the latter and it would be the intuitive guess. Outside
+// Lambda without LOCAL_DEBUG=true the SDK still calls lambda.Start and
+// the process hangs with no listener, which is what makes this log line
+// worth its three lines of code.
+func serveMode() string {
+	if os.Getenv("LOCAL_DEBUG") == "true" {
+		return "http (LOCAL_DEBUG=true)"
+	}
+	return "lambda runtime api"
 }
 
 // slogLogger adapts slog to the events.Logger / registry.Logger seam,
