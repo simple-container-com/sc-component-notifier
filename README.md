@@ -92,6 +92,105 @@ sc-component-notifier/
                    publish gate).
 ```
 
+## Storage (go-embedb adoption, step 1)
+
+The service persists its own state (tenants, events, deliveries, channels,
+cooldown, the single-flight drain lease) in an **object store**. Two
+backends are built into the binary, picked at boot by `USE_GOEMBEDB`:
+
+| `USE_GOEMBEDB` | Backend | Shape |
+|---|---|---|
+| unset or `0` (**default**) | `S3Store` (or `FSStore` for `STORAGE_TYPE=filesystem`) | one JSON object per key, under `STORAGE_BUCKET` + `STORAGE_PREFIX` |
+| `1` | `MongoStore` on top of embedded **go-embedb** (ferretdb + sqlite + active-active S3 replication) | one Mongo document per key, routed to a collection by path prefix |
+
+**This release ships the go-embedb code path with `USE_GOEMBEDB`
+defaulted off**, so a `main` deploy is bit-identical to the pre-adoption
+service. An operator flips the flag per stack only after
+`POST /admin/migrate-s3-to-goembedb?dry_run=1` reports count parity.
+
+Full design: [`forge/docs/design/2026-11-22/go-embedb-active-active-s3/`](https://github.com/simple-container-com/forge/tree/main/docs/design/2026-11-22/go-embedb-active-active-s3/).
+
+### Why a `replace` to a private pseudo-version
+
+`go-embedb` is a private fork of FerretDB. `service/go.mod` carries:
+
+```
+replace github.com/FerretDB/FerretDB =>
+    github.com/simple-container-com/go-embedb v0.0.0-20261123133627-155d9eb7d9e0
+```
+
+A module-path replace is NOT optional — a filesystem replace
+(`=> ../../go-embedb`) resolves only on an operator laptop that
+happens to have the fork checked out next door, and it fails in `go mod
+download` *before* any build tag or env var is read. That turns a flag
+defaulted-off into main-red the day it merges.
+
+Because the fork is private, CI needs a read credential. It lives in
+this repo's own SC registry — same as the fleet's `SC_CONFIG` pattern,
+nothing extra in GitHub Actions secrets:
+
+```sh
+# one-time bootstrap (operator)
+ssh-keygen -t ed25519 -N '' -f .sc/deploy-keys/go-embedb.pem
+# install the PUBLIC half as a deploy key on simple-container-com/go-embedb
+yes Y | sc secrets add .sc/deploy-keys/go-embedb.pem
+sc secrets hide --force
+echo '.sc/deploy-keys/go-embedb.pem' >> .gitignore
+```
+
+`.github/workflows/pr.yml` + `release.yml` then run `sc secrets reveal
+--force`, point `GIT_SSH_COMMAND` at the revealed key, and `go mod
+download` resolves. The Dockerfile mounts the same file as a buildx
+secret so the module layer gets cached without the key ever landing in
+an image layer.
+
+**Operator gate:** if `.sc/secrets.yaml` + `.sc/deploy-keys/go-embedb.pem`
+are not yet set up in this repo, CI's `service-test` will fail at the
+`sc secrets reveal` step until they are. That is the SAME blocker
+sc-component-observatory and sc-component-backup hit before their
+adoptions landed; the fix is the bootstrap recipe above, not a
+workaround in this PR.
+
+### Migration + rollback
+
+- **Dry-run first.** `POST /admin/migrate-s3-to-goembedb?dry_run=1`
+  with header `X-Admin-Token: <ADMIN_MIGRATION_TOKEN>` lists every
+  S3 key the migration would touch and the per-collection row count
+  on the destination, without writing. Operator diffs the two.
+- **Wet run.** Same endpoint without `dry_run=1`. Per-key errors are
+  non-fatal and surface in the response body; the migration is
+  idempotent (ReplaceOne-with-upsert), so a partial run can be
+  retried.
+- **Flip the flag.** Set `USE_GOEMBEDB=1` on the service and redeploy.
+  `notifier_store_backend{backend="goembedb"}` on `/metrics` goes to
+  `1`, `backend="s3"` to `0`.
+- **Rollback.** Unset `USE_GOEMBEDB` (or set `0`) and redeploy. S3Store
+  still holds the pre-cutover data, the two stores never cross-write,
+  and recent writes made while on go-embedb are lost on rollback — the
+  migration is forward-only within a cutover window. (A reverse
+  migration endpoint is a PR B follow-up, not shipped here.)
+
+### Metrics
+
+`GET /metrics` exposes Prometheus text-exposition, unauthenticated —
+process-level counters + `notifier_store_backend{backend="s3"|"goembedb"}`.
+Alerting pattern:
+
+```
+# A deploy that was supposed to flip to go-embedb but hasn't
+notifier_store_backend{backend="s3"} == 1 AND <expected-cutover-time>
+```
+
+### Admin token
+
+`ADMIN_MIGRATION_TOKEN` gates the migration endpoint. **Empty disables
+the endpoint entirely** — that is the safe default: an operator who
+did not opt in never opens an unauthenticated migration route. In this
+PR the value is read as a plain env; PR B binds it through the SC
+secret-env wire so an operator writes a one-line `migrationToken:` in
+`server.yaml` and the token arrives in the Lambda as a SecretsManager
+ARN.
+
 ## Running tests
 
 ```

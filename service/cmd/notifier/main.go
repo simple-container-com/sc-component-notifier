@@ -27,6 +27,35 @@
 //	STORAGE_USE_PATH_STYLE           non-empty => path-style (optional)
 //	STORAGE_PATH                     mount point for filesystem
 //	STORAGE_ACCESS_KEY / _SECRET_KEY optional; prefer the execution role
+//	USE_GOEMBEDB                     "1" to serve the live store from go-embedb
+//	                                 (ferretdb + sqlite + S3 replication) instead
+//	                                 of S3Store. DEFAULT OFF — step 1 of the
+//	                                 go-embedb adoption just ships the code path
+//	                                 behind this flag so a deploy is bit-identical
+//	                                 to pre-adoption until the operator flips it.
+//	                                 See README.md §Storage + the
+//	                                 sc-component-notifier-goembedb-migration
+//	                                 roadmap item.
+//	GOEMBEDB_S3_BUCKET               replication substrate bucket (optional; when
+//	                                 absent the embed runs single-node — no
+//	                                 cross-container durability, intended for
+//	                                 smoke / dev).
+//	GOEMBEDB_S3_PREFIX               key namespace under the replication bucket
+//	                                 (default sc-component-notifier/).
+//	GOEMBEDB_S3_REGION               region for the replication bucket (default
+//	                                 $AWS_REGION).
+//	GOEMBEDB_SQLITE_DIR              local sqlite dir (default /tmp/goembedb).
+//	GOEMBEDB_REPLSET_NAME            replica-set name (default notifier).
+//	GOEMBEDB_MAX_REPLICAS            cap on slot-table entries.
+//	GOEMBEDB_HEARTBEAT_TTL           slot heartbeat (default 3m on Lambda).
+//	GOEMBEDB_ACK_WAIT_LIVE_ONLY      truthy => ack ignores dead replicas (Bug 13
+//	                                 fix; auto-on when AWS_LAMBDA_FUNCTION_NAME
+//	                                 is set).
+//	ADMIN_MIGRATION_TOKEN            opt-in bearer that gates
+//	                                 POST /admin/migrate-s3-to-goembedb; empty
+//	                                 disables the endpoint. Read as raw env in
+//	                                 PR 1; PR B wires it through the SC secret
+//	                                 bind so the value arrives as an ARN.
 //	PORT                             listen port            (default 8080)
 //	LOCAL_DEBUG                      "true" => serve ordinary HTTP on $PORT.
 //	                                 Anything else (including unset) means the
@@ -70,6 +99,7 @@ import (
 	"github.com/simple-container-com/sc-component-notifier/service/internal/api"
 	"github.com/simple-container-com/sc-component-notifier/service/internal/crypto"
 	"github.com/simple-container-com/sc-component-notifier/service/internal/events"
+	"github.com/simple-container-com/sc-component-notifier/service/internal/goembedbadmin"
 	"github.com/simple-container-com/sc-component-notifier/service/internal/registry"
 	"github.com/simple-container-com/sc-component-notifier/service/internal/storage"
 	"github.com/simple-container-com/sc-component-notifier/service/internal/tenant"
@@ -129,11 +159,84 @@ func main() {
 		os.Exit(2)
 	}
 
-	objects, target, err := buildObjectStore(ctx)
-	if err != nil {
-		slog.Error("object storage unavailable", "err", err)
+	// Storage backend selection:
+	//
+	//   USE_GOEMBEDB unset or "0" (DEFAULT): S3Store. Current production.
+	//   USE_GOEMBEDB=1                     : MongoStore on top of an
+	//                                        embedded go-embedb (ferretdb +
+	//                                        sqlite + S3 replication).
+	//
+	// migrationSource stays non-nil whenever we built an S3Store, so the
+	// `/admin/migrate-s3-to-goembedb` endpoint has a source regardless of
+	// which backend serves the live traffic. See forge/docs/roadmap/items/
+	// sc-component-notifier-goembedb-migration.md.
+	var (
+		objects         storage.Store
+		target          string
+		migrationSource storage.Store
+		migrationSink   *storage.MongoStore
+	)
+	useGoEmbedb := strings.TrimSpace(os.Getenv("USE_GOEMBEDB")) == "1"
+
+	// Always build the S3 source when STORAGE_TYPE=s3 (default), both
+	// as the live backend and as the migration source. A deploy with
+	// USE_GOEMBEDB=1 but no S3 wiring is still valid — the migration
+	// just has no source to pull from.
+	if envOr("STORAGE_TYPE", "s3") == "s3" {
+		s3Store, loc, serr := buildObjectStore(ctx)
+		if serr != nil && !useGoEmbedb {
+			slog.Error("object storage unavailable", "err", serr)
+			os.Exit(2)
+		}
+		if serr == nil {
+			// buildObjectStore returns storage.Store; cast back to the
+			// S3Store concrete type so the migration source carries the
+			// If-None-Match ConditionalPutter path. Any non-S3 shape
+			// returned here is a programming error, not a runtime one.
+			migrationSource = s3Store
+			objects = s3Store
+			target = loc
+		}
+	} else if !useGoEmbedb {
+		// Non-S3 storage types (filesystem) go through the regular builder.
+		st, loc, serr := buildObjectStore(ctx)
+		if serr != nil {
+			slog.Error("object storage unavailable", "err", serr)
+			os.Exit(2)
+		}
+		objects = st
+		target = loc
+	}
+
+	if useGoEmbedb {
+		embed, berr := bootGoEmbed(slog.Default())
+		if berr != nil {
+			slog.Error("goembedb boot failed", "err", berr)
+			os.Exit(2)
+		}
+		mongoStore := storage.NewMongoStore(embed.Client)
+		// Register the TTL + unique indexes before the store serves any
+		// request — a cold Lambda hitting events/ or cooldown/ before
+		// the TTL sweep is wired would still work (writes succeed) but
+		// records would never age out, which is exactly the failure
+		// mode TestMongoStore_TTLHonoured exists to catch.
+		ictx, icancel := context.WithTimeout(ctx, 30*time.Second)
+		if err := mongoStore.EnsureIndexes(ictx); err != nil {
+			icancel()
+			slog.Error("goembedb ensure indexes failed", "err", err)
+			os.Exit(2)
+		}
+		icancel()
+		migrationSink = mongoStore
+		objects = mongoStore
+		target = "goembedb://" + embed.ReplSet
+	}
+
+	if objects == nil {
+		slog.Error("no storage backend configured (USE_GOEMBEDB unset and buildObjectStore returned nil)")
 		os.Exit(2)
 	}
+	goembedbadmin.SetStoreBackend(backendLabel(useGoEmbedb))
 	prefix := os.Getenv("STORAGE_PREFIX")
 
 	managed, err := loadManagedChannels(ctx)
@@ -176,6 +279,7 @@ func main() {
 	slog.Info("starting sc-component-notifier",
 		"version", version, "commit", commit, "revision", revision,
 		"port", envOr("PORT", "8080"), "storage", target,
+		"backend", backendLabel(useGoEmbedb),
 		"managed_channels", len(managed), "cooldown", cooldown.String(),
 		"self_url", os.Getenv("NOTIFIER_SELF_URL"),
 		// Not the value — just whether the dashboard can be logged into
@@ -210,6 +314,25 @@ func main() {
 	mux.Use(requestLogger)
 
 	mux.Get("/healthz", api.Healthz)
+
+	// Prometheus text-exposition. Unauthenticated: exposes process-level
+	// counters + the notifier_store_backend{backend="s3"|"goembedb"}
+	// gauge an operator alerts on after flipping USE_GOEMBEDB.
+	mux.Method(http.MethodGet, "/metrics", goembedbadmin.MetricsHandler())
+
+	// Migration endpoint. Disabled unless ADMIN_MIGRATION_TOKEN is set —
+	// the endpoint is a one-off operator tool for the S3 → go-embedb
+	// cutover, NOT a steady-state route. Source may be nil if
+	// USE_GOEMBEDB=1 was deployed without STORAGE_BUCKET, in which case
+	// the endpoint returns a 500 that names what is missing.
+	if adminToken := os.Getenv("ADMIN_MIGRATION_TOKEN"); adminToken != "" {
+		migration := &goembedbadmin.MigrationConfig{
+			Source:     migrationSource,
+			Sink:       migrationSink,
+			AdminToken: adminToken,
+		}
+		mux.Post("/admin/migrate-s3-to-goembedb", migration.Migrate)
+	}
 
 	// Unauthenticated on purpose: the SPA has to be able to ask what kind
 	// of login it is facing before it holds a credential, and a login
@@ -408,6 +531,16 @@ func envOr(name, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// backendLabel maps the USE_GOEMBEDB flag to the Prometheus label
+// value the gauge records. Centralised so the boot log and the gauge
+// agree.
+func backendLabel(useGoEmbedb bool) string {
+	if useGoEmbedb {
+		return "goembedb"
+	}
+	return "s3"
 }
 
 // serveMode names the branch go-aws-lambda-sdk's Start() will take, so

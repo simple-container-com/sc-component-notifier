@@ -1,14 +1,10 @@
 # Multi-stage build for the sc-component-notifier service.
 #
-# Shape cribbed from forge-notifier/Dockerfile:
+# Shape:
 #   1. Node builder — compile the React SPA into service/internal/ui/dist.
 #   2. Go builder — build the Go binary with the SPA embedded via
 #      //go:embed all:dist.
-#   3. Runtime — public.ecr.aws/amazonlinux/amazonlinux:2023, same as
-#      sc-component-observatory. The binary runs under aws-lambda-go's
-#      runtime or as a standalone HTTP server when PORT is set (both
-#      shapes work because go-aws-lambda-sdk's sdkservice detects the
-#      environment).
+#   3. Runtime — public.ecr.aws/amazonlinux/amazonlinux:2023.
 #
 # NOT `public.ecr.aws/lambda/provided:al2023`, which is what this file
 # was scaffolded with. Two reasons, in order of how much they cost:
@@ -23,17 +19,15 @@
 #     image. Observatory has run on the plain amazonlinux base since it
 #     shipped.
 #
-# Consequence of the swap: the binary lands at /usr/local/bin/notifier
-# with an explicit ENTRYPOINT rather than at /var/task/bootstrap, which
-# only the lambda base's entrypoint would have looked for.
-#
 # Build args:
 #   - VERSION    (auto-injected by SC per fleet CLAUDE.md "How SC builds images")
-#   - COMMIT     (operator-declared under client.yaml image.build.args — see
-#                 sc-auto-inject-github-sha-and-repository-build-args roadmap item)
+#   - COMMIT     (operator-declared under client.yaml image.build.args)
 #   - REVISION   (same)
 
-ARG GOLANG_VERSION=1.26-alpine
+# GOLANG_VERSION bumped from 1.26-alpine for go-embedb (which pins
+# `go 1.27.3` in its module directive, so go.mod loading fails on older
+# toolchains with `invalid go version`).
+ARG GOLANG_VERSION=1.27-alpine
 ARG NODE_VERSION=20-alpine
 ARG RUNTIME_BASE=public.ecr.aws/amazonlinux/amazonlinux:2023
 
@@ -57,13 +51,44 @@ RUN npm run build:prod
 # -----------------------------
 FROM golang:${GOLANG_VERSION} AS go-builder
 
-RUN apk add --no-cache ca-certificates git make
+# openssh-client is for the private-module fetch below, not for the
+# runtime image — stage 3 copies only the binary.
+RUN apk add --no-cache ca-certificates git make openssh-client
 
 WORKDIR /src
 
-# Copy module files first for layer-cache friendliness.
-COPY go.mod go.sum* ./
-RUN go mod download
+# go.mod routes github.com/FerretDB/FerretDB to the PRIVATE fork
+# github.com/simple-container-com/go-embedb, so `go mod download`
+# needs a credential. It arrives as a buildx secret mount rather than
+# a COPY or a build ARG:
+#
+#   - a COPY would need the key inside the build context (service/,
+#     see release.yml), but the key lives at the repo root — and a COPY
+#     also leaves it in this stage's layer;
+#   - an ARG is echoed into the build log by any docker frontend that
+#     prints the command line.
+#
+# The mount exists only for the lifetime of the RUN and never becomes
+# a layer. The release + PR workflows supply it with
+# `secret-files: go_embedb_key=.sc/deploy-keys/go-embedb.pem` after
+# `sc secrets reveal --force`; see README.md §Storage.
+#
+# GOPRIVATE does three things at once: keeps the module off the public
+# proxy (which cannot read a private repo and answers with a confusing
+# `invalid version` wrapping git's auth failure), off the checksum
+# database, and therefore on the direct git path the insteadOf rewrite
+# redirects to SSH.
+ENV GOPRIVATE=github.com/simple-container-com/*
+
+# Dependency layer first so a source-only change does not re-download
+# the module cache.
+COPY go.mod go.sum ./
+RUN --mount=type=secret,id=go_embedb_key \
+      mkdir -p /root/.ssh \
+    && ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> /root/.ssh/known_hosts 2>/dev/null \
+    && git config --global url."git@github.com:".insteadOf "https://github.com/" \
+    && GIT_SSH_COMMAND="ssh -i /run/secrets/go_embedb_key -o IdentitiesOnly=yes" \
+       go mod download
 
 COPY . .
 # Overwrite internal/ui/dist with the compiled SPA from stage 1.
@@ -73,6 +98,11 @@ ARG VERSION=dev
 ARG COMMIT=dev
 ARG REVISION=dev
 
+# -buildvcs=false: go-embedb's build/version/version.go init() panics
+# when the git-derived vcs.revision disagrees with commit.txt. In an
+# SC build the git tree in /src ≠ what go stamps as vcs.revision.
+# Harmless when USE_GOEMBEDB=0 (the dep still links) and required when
+# USE_GOEMBEDB=1.
 RUN CGO_ENABLED=0 GOOS=linux go build \
       -trimpath -buildvcs=false \
       -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.revision=${REVISION}" \
