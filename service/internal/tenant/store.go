@@ -6,114 +6,23 @@ package tenant
 import (
 	"context"
 	"sync"
-
-	"github.com/pkg/errors"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-// Store is the tenant repository interface. Two implementations: MongoStore
-// (production) and InMemoryStore (tests).
+// Store is the tenant repository interface. Two implementations:
+// BlobStore (production, in store_blob.go) and InMemoryStore (tests).
+//
+// There is no Mongo implementation, deliberately. The scaffold this repo
+// was copied from had one, and it was removed rather than carried: a
+// notifier tracks a handful of tenants and a few events a day, which
+// does not justify a paid cluster, and sc-component-observatory runs the
+// same shape on object storage alone. `storage: <resource-name>` stays
+// the operator's ONLY storage knob.
 type Store interface {
 	Upsert(ctx context.Context, record Record) error
 	List(ctx context.Context) ([]Record, error)
 	Get(ctx context.Context, stackName string) (Record, bool, error)
 	SoftDelete(ctx context.Context, stackName string) error
 	Close(ctx context.Context) error
-}
-
-// -------------------- Mongo implementation --------------------
-
-const (
-	defaultDBName         = "sc_component_notifier"
-	defaultCollectionName = "tenants"
-)
-
-// MongoStore is the production Store, backed by a single collection.
-type MongoStore struct {
-	client     *mongo.Client
-	collection *mongo.Collection
-}
-
-// NewMongoStore opens a Mongo client, pings the server, creates an index
-// on stackName. Blocks until the ping returns (bounded by ctx deadline).
-func NewMongoStore(ctx context.Context, uri string) (*MongoStore, error) {
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
-	if err != nil {
-		return nil, errors.Wrap(err, "mongo connect")
-	}
-	if err := client.Ping(ctx, nil); err != nil {
-		_ = client.Disconnect(ctx)
-		return nil, errors.Wrap(err, "mongo ping")
-	}
-	coll := client.Database(defaultDBName).Collection(defaultCollectionName)
-
-	// Unique index on stackName — enforces (stackName, version) idempotency
-	// at the DB level. Upserts use stackName as the match key.
-	if _, err := coll.Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys:    bson.D{{Key: "stackName", Value: 1}},
-		Options: options.Index().SetUnique(true),
-	}); err != nil {
-		_ = client.Disconnect(ctx)
-		return nil, errors.Wrap(err, "mongo index create")
-	}
-	return &MongoStore{client: client, collection: coll}, nil
-}
-
-// Upsert inserts a new tenant row or replaces an existing one by stackName.
-func (s *MongoStore) Upsert(ctx context.Context, record Record) error {
-	filter := bson.M{"stackName": record.StackName}
-	opts := options.Replace().SetUpsert(true)
-	if _, err := s.collection.ReplaceOne(ctx, filter, record, opts); err != nil {
-		return errors.Wrap(err, "mongo replace")
-	}
-	return nil
-}
-
-// List returns every tenant row, soft-deleted included (for operator SPA
-// visibility).
-func (s *MongoStore) List(ctx context.Context) ([]Record, error) {
-	cursor, err := s.collection.Find(ctx, bson.M{})
-	if err != nil {
-		return nil, errors.Wrap(err, "mongo find")
-	}
-	defer cursor.Close(ctx)
-	var rows []Record
-	if err := cursor.All(ctx, &rows); err != nil {
-		return nil, errors.Wrap(err, "mongo cursor all")
-	}
-	return rows, nil
-}
-
-// Get fetches a single tenant by stackName.
-func (s *MongoStore) Get(ctx context.Context, stackName string) (Record, bool, error) {
-	var r Record
-	err := s.collection.FindOne(ctx, bson.M{"stackName": stackName}).Decode(&r)
-	if err == mongo.ErrNoDocuments {
-		return Record{}, false, nil
-	}
-	if err != nil {
-		return Record{}, false, errors.Wrap(err, "mongo find one")
-	}
-	return r, true, nil
-}
-
-// SoftDelete marks a tenant as removed without physically dropping the
-// row — an operator can still see it in the SPA with a "removed" badge.
-func (s *MongoStore) SoftDelete(ctx context.Context, stackName string) error {
-	_, err := s.collection.UpdateOne(ctx,
-		bson.M{"stackName": stackName},
-		bson.M{"$set": bson.M{"softDeleted": true}})
-	if err != nil {
-		return errors.Wrap(err, "mongo update one")
-	}
-	return nil
-}
-
-// Close disconnects the Mongo client.
-func (s *MongoStore) Close(ctx context.Context) error {
-	return s.client.Disconnect(ctx)
 }
 
 // -------------------- In-memory implementation (tests) --------------------
@@ -124,8 +33,7 @@ type InMemoryStore struct {
 	rows map[string]Record
 }
 
-// NewInMemoryStore returns an empty store. Useful in handler tests that
-// don't want a real Mongo.
+// NewInMemoryStore returns an empty store, for tests.
 func NewInMemoryStore() *InMemoryStore {
 	return &InMemoryStore{rows: map[string]Record{}}
 }

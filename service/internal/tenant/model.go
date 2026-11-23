@@ -7,28 +7,36 @@ import "time"
 
 // Record is one tenant row — one `(consumer-stack, version)` pair.
 //
-// The plugin's push-register call produces the StackName / Version /
-// Resources fields; the service fills in CreatedAt / LastSeenAt.
+// The publisher plugin's push-register call produces the StackName /
+// Version / Resources fields; the service fills in CreatedAt /
+// LastSeenAt.
 //
-// Real components (Backup, Monitoring, …) would add per-type fields:
-// Backup.ScheduleHint, Monitoring.MetricsEndpoint, etc. The notifier just
-// records the shape.
+// A tenant here is a PUBLISHER: the backup or observatory component that
+// sends events. Its stack name becomes the `source` on every event it
+// publishes (filled from the JWT's tenant claim, never from the body),
+// so this row is what a channel's `sources:` allowlist is checked
+// against.
+//
+// Tags are JSON only. The scaffold carried `bson:` tags alongside them
+// from its Mongo original; they were removed with the Mongo store,
+// because a tag for a driver that is no longer a dependency reads like
+// evidence of a database path that does not exist.
 type Record struct {
-	StackName   string     `bson:"stackName" json:"stackName"`
-	Version     string     `bson:"version" json:"version"`
-	Resources   []Resource `bson:"resources" json:"resources"`
-	OrgID       string     `bson:"orgId,omitempty" json:"orgId,omitempty"`
-	CreatedAt   time.Time  `bson:"createdAt" json:"createdAt"`
-	LastSeenAt  time.Time  `bson:"lastSeenAt" json:"lastSeenAt"`
-	SoftDeleted bool       `bson:"softDeleted,omitempty" json:"softDeleted,omitempty"`
+	StackName   string     `json:"stackName"`
+	Version     string     `json:"version"`
+	Resources   []Resource `json:"resources"`
+	OrgID       string     `json:"orgId,omitempty"`
+	CreatedAt   time.Time  `json:"createdAt"`
+	LastSeenAt  time.Time  `json:"lastSeenAt"`
+	SoftDeleted bool       `json:"softDeleted,omitempty"`
 }
 
-// Resource describes one sibling resource the consumer has (DB, S3, …).
-// For the notifier, this is a pass-through — the service doesn't act on it.
-// Real components (Backup) would parse the `connection.*` family to
-// reach the DB.
+// Resource describes one sibling resource the publisher has (DB, S3, …).
+// A pass-through for the notifier — it does not act on these, but an
+// operator reading the SPA wants to know what the publisher manages, and
+// a future channel could route on it.
 type Resource struct {
-	Type       string            `bson:"type" json:"type"`
-	Name       string            `bson:"name" json:"name"`
-	Connection map[string]string `bson:"connection,omitempty" json:"connection,omitempty"`
+	Type       string            `json:"type"`
+	Name       string            `json:"name"`
+	Connection map[string]string `json:"connection,omitempty"`
 }
