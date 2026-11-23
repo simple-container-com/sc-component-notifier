@@ -232,7 +232,7 @@ func main() {
 		r.Use(api.JWTMiddleware([]byte(jwtSecret)))
 		r.Post("/api/v1/tenants/register", api.TenantsRegister(tenantStore))
 		r.Get("/api/v1/tenants", api.TenantsList(tenantStore))
-		r.Post("/api/v1/events", api.EventsIngest(eventStore, router, reg, nil))
+		r.Post("/api/v1/events", api.EventsIngest(eventStore, router, reg, tenantStore, nil))
 		r.Post("/api/v1/scheduler/delivery/tick", api.DeliveryTick(drainer))
 	})
 

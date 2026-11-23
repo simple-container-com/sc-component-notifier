@@ -19,6 +19,7 @@ import (
 	"github.com/simple-container-com/sc-component-notifier/service/internal/channel"
 	"github.com/simple-container-com/sc-component-notifier/service/internal/events"
 	"github.com/simple-container-com/sc-component-notifier/service/internal/storage"
+	"github.com/simple-container-com/sc-component-notifier/service/internal/tenant"
 )
 
 // mintOpJWT mints a token for an arbitrary op, so a test can prove that
@@ -52,9 +53,10 @@ func oneChannel() stubRoutes {
 }
 
 type ingestFixture struct {
-	store  events.Store
-	routes RouteSource
-	mux    *http.ServeMux
+	store   events.Store
+	routes  RouteSource
+	tenants tenant.Store
+	mux     *http.ServeMux
 }
 
 func newIngestFixture(t *testing.T, store events.Store, routes RouteSource) *ingestFixture {
@@ -66,10 +68,11 @@ func newIngestFixture(t *testing.T, store events.Store, routes RouteSource) *ing
 	// the handler's gates, and a 15-minute quiet period would make the
 	// second event in any test vanish for an unrelated reason.
 	router := events.NewRouter(store, -1)
+	tenants := tenant.NewInMemoryStore()
 	mux := http.NewServeMux()
 	mux.Handle("POST /api/v1/events",
-		JWTMiddleware([]byte(testKey))(EventsIngest(store, router, routes, nil)))
-	return &ingestFixture{store: store, routes: routes, mux: mux}
+		JWTMiddleware([]byte(testKey))(EventsIngest(store, router, routes, tenants, nil)))
+	return &ingestFixture{store: store, routes: routes, tenants: tenants, mux: mux}
 }
 
 func (f *ingestFixture) post(t *testing.T, op, tenantName string, body map[string]any) *httptest.ResponseRecorder {
@@ -321,6 +324,172 @@ func TestEventsIngest_RejectsTokenWithoutTenant(t *testing.T) {
 	rr := f.post(t, "event", "", validEvent())
 	Expect(rr.Code).To(Equal(http.StatusForbidden))
 	Expect(f.deliveries(t)).To(BeEmpty())
+}
+
+// --- Lazy tenant registration (hazard 6) ---------------------------------
+//
+// The publisher's plugin push-registers at deploy time, but that call is
+// best-effort by design: on a first provision the notifier's own Lambda
+// does not exist yet, so requiring it would deadlock a stack that declares
+// both the notifier and a publisher. These tests cover the path that makes
+// the tenant row appear anyway, and — more importantly — that nothing on it
+// can cost an operator an alert.
+
+func (f *ingestFixture) tenant(t *testing.T, stackName string) (tenant.Record, bool) {
+	t.Helper()
+	rec, found, err := f.tenants.Get(context.Background(), stackName)
+	Expect(err).ToNot(HaveOccurred())
+	return rec, found
+}
+
+// The reason registration is allowed to fail: a publisher that never
+// managed to register is still a real publisher, and its first event is
+// proof. The `tenant` claim is already authenticated and is already the
+// authority for `source`, so the row grants nothing new.
+func TestEventsIngest_FirstEventRegistersTheTenant(t *testing.T) {
+	RegisterTestingT(t)
+	f := newIngestFixture(t, nil, oneChannel())
+
+	_, found := f.tenant(t, "my-backup")
+	Expect(found).To(BeFalse(), "fixture precondition: the tenant must start absent")
+
+	Expect(f.post(t, "event", "my-backup", validEvent()).Code).To(Equal(http.StatusAccepted))
+
+	rec, found := f.tenant(t, "my-backup")
+	Expect(found).To(BeTrue(), "a publisher that never push-registered stayed invisible in the tenant list")
+	Expect(rec.StackName).To(Equal("my-backup"))
+	Expect(rec.CreatedAt).ToNot(BeZero())
+	Expect(rec.LastSeenAt).ToNot(BeZero())
+}
+
+// LastSeenAt is what makes the tenant list worth reading. Without this
+// refresh a publisher's "last seen" is its last DEPLOY, so one that has
+// gone silent looks identical to one that is healthy with nothing to
+// report — the exact confusion the list exists to resolve.
+func TestEventsIngest_SubsequentEventRefreshesLastSeen(t *testing.T) {
+	RegisterTestingT(t)
+	f := newIngestFixture(t, nil, oneChannel())
+	// A controlled clock, because real time makes this assertion vacuous:
+	// two posts land in the same millisecond, so `LastSeenAt >= first`
+	// holds whether the refresh happened or not, and a mutation that skips
+	// the refresh entirely passes.
+	clock := time.Date(2026, 11, 23, 9, 0, 0, 0, time.UTC)
+	f.rewireNow(func() time.Time { return clock })
+
+	Expect(f.post(t, "event", "my-backup", validEvent()).Code).To(Equal(http.StatusAccepted))
+	first, _ := f.tenant(t, "my-backup")
+
+	// A DIFFERENT id: the same one would short-circuit at the dedupe gate,
+	// which sits before the bookkeeping on purpose.
+	clock = clock.Add(90 * time.Minute)
+	second := validEvent()
+	second["id"] = "backup.failed:forge-conductor:run-8"
+	Expect(f.post(t, "event", "my-backup", second).Code).To(Equal(http.StatusAccepted))
+
+	rec, _ := f.tenant(t, "my-backup")
+	Expect(rec.LastSeenAt).To(BeTemporally("==", clock),
+		"last seen was not refreshed, so a publisher that has gone quiet reads as healthy")
+	Expect(rec.CreatedAt).To(BeTemporally("==", first.CreatedAt),
+		"a refresh must not restamp CreatedAt — that is the only record of when the publisher first appeared")
+}
+
+// A soft-deleted tenant that is demonstrably alive and publishing is
+// revived rather than left invisible. The alternative is an operator
+// watching a list that omits the publisher currently paging them.
+func TestEventsIngest_SoftDeletedTenantIsRevivedByPublishing(t *testing.T) {
+	RegisterTestingT(t)
+	f := newIngestFixture(t, nil, oneChannel())
+
+	Expect(f.tenants.Upsert(context.Background(), tenant.Record{
+		StackName:   "my-backup",
+		CreatedAt:   time.Now().UTC().Add(-time.Hour),
+		SoftDeleted: true,
+	})).To(Succeed())
+
+	Expect(f.post(t, "event", "my-backup", validEvent()).Code).To(Equal(http.StatusAccepted))
+
+	rec, found := f.tenant(t, "my-backup")
+	Expect(found).To(BeTrue())
+	Expect(rec.SoftDeleted).To(BeFalse(), "a publishing tenant stayed soft-deleted, i.e. hidden from the operator")
+}
+
+// failingTenants fails one of the two store calls. Both are covered
+// below: a fake that fails the LOOKUP never reaches the upsert, so it
+// cannot prove the upsert path is safe — which is how the first version
+// of this test passed while a panic in the upsert branch went unnoticed.
+type failingTenants struct {
+	tenant.Store
+	failGet bool
+	gets    int
+	upserts int
+}
+
+func (f *failingTenants) Get(context.Context, string) (tenant.Record, bool, error) {
+	f.gets++
+	if f.failGet {
+		return tenant.Record{}, false, errors.New("storage unavailable")
+	}
+	return tenant.Record{}, false, nil
+}
+
+func (f *failingTenants) Upsert(context.Context, tenant.Record) error {
+	f.upserts++
+	return errors.New("storage unavailable")
+}
+
+func (f *ingestFixture) rewireTenants(tenants tenant.Store) {
+	f.mux = http.NewServeMux()
+	f.mux.Handle("POST /api/v1/events",
+		JWTMiddleware([]byte(testKey))(EventsIngest(f.store, events.NewRouter(f.store, -1), f.routes, tenants, nil)))
+}
+
+// rewireNow rebuilds the handler on a controlled clock, keeping the
+// fixture's own stores.
+func (f *ingestFixture) rewireNow(now func() time.Time) {
+	f.mux = http.NewServeMux()
+	f.mux.Handle("POST /api/v1/events",
+		JWTMiddleware([]byte(testKey))(EventsIngest(f.store, events.NewRouter(f.store, -1), f.routes, f.tenants, now)))
+}
+
+// The trade stated plainly: losing the alert to fix the bookkeeping is
+// the wrong way round. Unlike the dedupe check — which fails CLOSED
+// because a duplicate storm is a real harm — nothing downstream depends
+// on the tenant row, so this is the handler's only deliberate fail-open.
+func TestEventsIngest_TenantStoreFailureDoesNotFailTheEvent(t *testing.T) {
+	RegisterTestingT(t)
+	for _, tc := range []struct {
+		name    string
+		failGet bool
+		// What the fake must record, so a test that silently stops
+		// reaching the failing call fails instead of passing.
+		wantGets    int
+		wantUpserts int
+	}{
+		{name: "the lookup fails", failGet: true, wantGets: 1, wantUpserts: 0},
+		{name: "the lookup succeeds and the upsert fails", failGet: false, wantGets: 1, wantUpserts: 1},
+	} {
+		f := newIngestFixture(t, nil, oneChannel())
+		broken := &failingTenants{failGet: tc.failGet}
+		f.rewireTenants(broken)
+
+		Expect(f.post(t, "event", "my-backup", validEvent()).Code).To(Equal(http.StatusAccepted),
+			"%s: a tenant-store outage rejected an event it had no business touching", tc.name)
+		Expect(f.deliveries(t)).To(HaveLen(1), "%s: the delivery was not enqueued", tc.name)
+		Expect(broken.gets).To(Equal(tc.wantGets), "%s: store.Get call count", tc.name)
+		Expect(broken.upserts).To(Equal(tc.wantUpserts), "%s: store.Upsert call count", tc.name)
+	}
+}
+
+// A nil store is the explicitly supported shape (the signature documents
+// it), because a caller wiring the handler without a tenant store must
+// not panic mid-ingest.
+func TestEventsIngest_NilTenantStoreIsInert(t *testing.T) {
+	RegisterTestingT(t)
+	f := newIngestFixture(t, nil, oneChannel())
+	f.rewireTenants(nil)
+
+	Expect(f.post(t, "event", "my-backup", validEvent()).Code).To(Equal(http.StatusAccepted))
+	Expect(f.deliveries(t)).To(HaveLen(1))
 }
 
 func TestEventsIngest_MalformedBodyIs400(t *testing.T) {

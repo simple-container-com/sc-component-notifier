@@ -15,8 +15,9 @@
 //	                  service receives them as env without the operator
 //	                  writing any.
 //	ComputeProcess  — fires per publisher that lists this component in
-//	                  `uses:`; push-registers the deploy and injects the
-//	                  publisher's NOTIFY_URL + NOTIFY_TOKEN.
+//	                  `uses:`; injects the publisher's SC_NOTIFY_URL +
+//	                  SC_NOTIFY_TOKEN, publishes `${resource:<name>.url}`
+//	                  and `.token`, and push-registers the deploy.
 //	PreDestroy      — best-effort cleanup when the component itself is
 //	                  torn down.
 //	LogStream       — drains this plugin's progress lines into the deploy
@@ -336,8 +337,23 @@ func (p *notifierPlugin) PreProvision(stdctx context.Context, req *scpluginv1.Pr
 		return nil, fmt.Errorf("notifier component %q has an invalid `channels` block: %w", resName, cErr)
 	}
 
+	selfURL := notifier.SelfURLFromConfig(raw)
+
 	tpl := map[string]string{
-		"self-url":       notifier.SelfURLFromConfig(raw),
+		"self-url": selfURL,
+		// `url` is the alias operators actually reach for — it pairs with
+		// `${resource:<name>.token}`, which ComputeProcess publishes under
+		// that short name. `self-url` is kept because live config
+		// references it (forge's server.yaml among others) and because
+		// PreProvision extensions are a published contract.
+		//
+		// Note the asymmetry between the two keys, and that it is
+		// structural rather than an oversight: `url` is the same value for
+		// every consumer, so it can be published here, once, and resolves
+		// for ANY resource. A token cannot — its `tenant` claim names one
+		// consumer — so `token` is published by ComputeProcess instead and
+		// resolves only for a resource that declared `uses:`.
+		"url":            selfURL,
 		"storage-bucket": notifier.BucketForStorageRef(raw, resName, env),
 		"storage-region": notifier.StorageRegionFromConfig(raw),
 		"storage-prefix": notifier.StoragePrefixFromConfig(raw),
@@ -438,9 +454,14 @@ func (p *notifierPlugin) Provision(stdctx context.Context, req *scpluginv1.Provi
 }
 
 // ComputeProcess fires once per publisher that lists this component in
-// `uses:`. It push-registers that deploy as a tenant and injects the
-// publisher's runtime wiring: NOTIFY_URL (where to send) and
-// NOTIFY_TOKEN (what to send it with).
+// `uses:`. It injects that publisher's runtime wiring — SC_NOTIFY_URL
+// (where to send) and SC_NOTIFY_TOKEN (what to send it with) — publishes
+// the same pair as `${resource:<name>.url}` / `.token` template
+// extensions, and push-registers the deploy as a tenant.
+//
+// Only the wiring is load-bearing. Registration is best-effort: see the
+// comment at its call site in internal/compute.go for why it must not
+// fail a deploy.
 func (p *notifierPlugin) ComputeProcess(stdctx context.Context, req *scpluginv1.ComputeProcessRequest) (resp *scpluginv1.ComputeProcessResponse, err error) {
 	rctx, err := runtime.NewContext(stdctx, req.GetHeader(), runtime.WithLocalEngineFallback(p.progress))
 	if err != nil {
