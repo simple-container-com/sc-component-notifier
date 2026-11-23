@@ -30,12 +30,37 @@ import (
 // consumer deploys behave when the Backup service is cold / rolling /
 // 5xx-ing.
 const (
-	maxAttempts        = 3
-	attemptTimeout     = 10 * time.Second
-	registerJWTTTL     = 60 * time.Second
-	userAgent          = "sc-component-notifier/0.0.1 (+https://github.com/simple-container-com/sc-component-notifier)"
-	notifyURLVar       = "NOTIFY_URL"   // injected into the publisher's env (plain)
-	notifyTokenVar     = "NOTIFY_TOKEN" // injected into the publisher's env (secret)
+	maxAttempts    = 3
+	attemptTimeout = 10 * time.Second
+	registerJWTTTL = 60 * time.Second
+	userAgent      = "sc-component-notifier/0.0.1 (+https://github.com/simple-container-com/sc-component-notifier)"
+
+	// Injected into the consumer's env. The `SC_` prefix is not cosmetic:
+	// it is the reserved namespace for anything SC injects into a
+	// workload, and SC core REFUSES an injected name outside it. That is
+	// what makes auto-injection safe — a provider plugin cannot shadow an
+	// application's own `NOTIFY_URL`, `DATABASE_URL` or anything else the
+	// consumer owns. Renamed from the unprefixed `NOTIFY_*` on
+	// 2026-11-23, while the live tenant count was still zero and both
+	// publisher PRs were still draft; it would not have been free later.
+	notifyURLVar   = "SC_NOTIFY_URL"   // plain
+	notifyTokenVar = "SC_NOTIFY_TOKEN" // secret
+
+	// Template-extension keys, i.e. the `<key>` in
+	// `${resource:my-notifier.<key>}`. The split is by whether the value
+	// can be known without a consumer:
+	//
+	//   - `url` is one value for everyone, so PreProvision publishes it
+	//     (see main.go) and it resolves for ANY resource.
+	//   - `token` carries a `tenant` claim scoped to one consumer, so only
+	//     ComputeProcess can publish it — and therefore it resolves ONLY
+	//     for a resource that declared `uses: [my-notifier]`. Elsewhere
+	//     `ResolvePlaceholders` fails OPEN and hands on the literal
+	//     string, which is why SC core refuses a `uses:`-derived value
+	//     that still contains `${resource:`.
+	tplKeyURL   = "url"
+	tplKeyToken = "token"
+
 	tenantsRegisterURL = "/api/v1/tenants/register"
 )
 
@@ -68,9 +93,17 @@ func NewProcessor(cfg ProcessorConfig) *Processor {
 //     `_deployed_service` key SC core's sidecar wrapper populates in
 //     slice 1a; or a `<my-notifier>-service-url` export from Provision).
 //   - Mints a short-TTL HS256 JWT with the consumer stack as `tenant`.
+//   - Injects SC_NOTIFY_URL + SC_NOTIFY_TOKEN env into the consumer, and
+//     publishes the same pair as `${resource:<name>.url}` /
+//     `${resource:<name>.token}` template extensions.
 //   - POSTs a tenant record to {service-url}/api/v1/tenants/register,
-//     with the retry policy from design doc §P3.
-//   - Injects NOTIFY_URL + NOTIFY_TOKEN env into the consumer.
+//     with the retry policy from design doc §P3. Best-effort — see the
+//     comment at the call site.
+//
+// Called for a client.yaml service with `uses: [my-notifier]`, and — since
+// SC core gained `uses:` on Components — for a sibling component with the
+// same line. The two paths are indistinguishable from here, which is the
+// point: there is one consumer contract, not two.
 //
 // The signing key is read from the plugin's own Provision inputs
 // (`signingKey`); for the notifier's purposes we expect the test harness to
@@ -105,16 +138,10 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 		Resources: readConsumerResources(input),
 	}
 
-	if err := p.pushRegister(ctx.Context(), serviceURL, registerToken, record); err != nil {
-		// The consumer's deploy fails, with a diagnosable error naming
-		// the component as the blocker (per §P3 non-silent-skip rule).
-		return nil, errors.Wrapf(err,
-			"component %q unreachable after %d attempts (check the component service is live at %s; or remove the component from client.yaml uses: if intentionally torn down)",
-			resName, maxAttempts, serviceURL)
-	}
-
-	// On success, inject the publisher's runtime wiring: where to send
-	// (plain) and what to send it with (secret).
+	// Inject the publisher's runtime wiring FIRST, and unconditionally:
+	// where to send (plain) and what to send it with (secret). Both values
+	// are computed locally — no network — so there is nothing here that can
+	// fail halfway.
 	//
 	// NOTE the two tokens are NOT the same credential. The registration
 	// token above lives for 60 seconds and is spent by this plugin
@@ -125,7 +152,47 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 	collector.AddEnvVariableIfNotExist(notifyURLVar, serviceURL, resType, resName, stackName)
 	collector.AddSecretEnvVariableIfNotExist(notifyTokenVar, eventToken, resType, resName, stackName)
 
-	if p.cfg.Progress != nil {
+	// The same two values as `${resource:<name>.url}` /
+	// `${resource:<name>.token}`, for a consumer whose config needs them
+	// somewhere other than its env (a nested field, a template arg). The
+	// extension is keyed by THIS resource's name and is per-consumer: the
+	// token differs for every consumer because its `tenant` claim does.
+	// SC core's compute sidecar re-applies it to the shared collector, and
+	// the consumer's own `ResolvePlaceholders` pass reads it back.
+	collector.AddResourceTplExtension(resName, map[string]string{
+		tplKeyURL:   serviceURL,
+		tplKeyToken: eventToken,
+	})
+
+	// Registration is an OPTIMISATION, not a precondition — it WARNS.
+	//
+	// It used to fail the consumer's deploy after maxAttempts, which was
+	// defensible while the only consumers were client.yaml services
+	// deployed long after the notifier existed. It is a deadlock once a
+	// sibling COMPONENT can be a consumer: on a first provision the
+	// notifier's own Lambda does not exist yet, so every publisher in the
+	// same stack would fail, including on the very provision that creates
+	// the notifier.
+	//
+	// Nothing is lost by warning, because the event token already carries
+	// the `tenant` claim and the ingest handler creates the tenant row on
+	// first event (service/internal/api, ensureTenant). Registration only
+	// makes the publisher appear in the SPA *before* it has anything to
+	// say.
+	//
+	// The line this keeps: UNRESOLVABLE WIRING STILL HARD-FAILS — the two
+	// `readServiceURL`/`readSigningKey` errors above return. A publisher
+	// with no URL or no token can never alert anyone, and a notifier that
+	// silently does not notify is the worst outcome available. A publisher
+	// that is merely not yet listed can.
+	if err := p.pushRegister(ctx.Context(), serviceURL, registerToken, record); err != nil {
+		if p.cfg.Progress != nil {
+			p.cfg.Progress.Error("compute-process", fmt.Sprintf(
+				"tenant %q not pre-registered at %s after %d attempts: %v — wiring injected anyway; the tenant row is created on its first event",
+				stackName, serviceURL, maxAttempts, err,
+			))
+		}
+	} else if p.cfg.Progress != nil {
 		p.cfg.Progress.Info("compute-process", fmt.Sprintf("registered tenant %q at %s", stackName, serviceURL))
 	}
 

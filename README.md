@@ -13,6 +13,54 @@ pushes a tenant registration to the deployed component service via a
 JWT-authed HTTP call — tenants persist in the component service's own DB,
 not in Pulumi state.
 
+## Publishing to it — the consumer contract
+
+Declaring the dependency is the whole of the wiring. No hand-minted token,
+no `sc secrets add`, no hostname in config:
+
+```yaml
+my-backup:
+  type: sc-backup
+  uses: [my-notifier]        # ← this line is the wiring
+```
+
+SC mints a per-consumer `op:"event"` JWT and injects two env vars into the
+consumer:
+
+| Var | Kind | Value |
+|---|---|---|
+| `SC_NOTIFY_URL` | plain | the notifier's base URL |
+| `SC_NOTIFY_TOKEN` | **secret** | that consumer's own event token |
+
+The `SC_` prefix is reserved: SC core refuses an injected name outside it,
+so a provider plugin can never shadow an application's own `NOTIFY_URL`,
+`DATABASE_URL`, or anything else the consumer owns.
+
+The same two values are also reachable as template placeholders, for a
+consumer whose config needs them somewhere other than its env:
+
+```yaml
+    endpoint: "${resource:my-notifier.url}/api/v1/events"
+    token:    "${resource:my-notifier.token}"
+```
+
+**`url` and `token` are not equally available, and the asymmetry is
+structural.** `url` is one value for everyone, so PreProvision publishes it
+and it resolves for *any* resource. `token` carries a `tenant` claim scoped
+to one consumer, so only `ComputeProcess` can publish it — and therefore it
+resolves **only for a resource that declared `uses: [my-notifier]`**.
+Elsewhere SC's placeholder resolution fails *open* and hands on the literal
+string `${resource:my-notifier.token}`, which deploys cleanly and surfaces
+as a 401 at the first incident. SC core refuses a `uses:`-derived value
+that still contains `${resource:` for exactly this reason; if you reference
+`.token` anywhere else, you own that failure.
+
+Each consumer's token is distinct because its `tenant` claim is, and the
+ingest handler takes an event's `source` from that claim rather than from
+the request body. Two publishers sharing a token would mean every alert
+from one is attributed to the other, and a channel's `sources:` allowlist
+would silently stop meaning what it says.
+
 The design doc is at [`forge/docs/design/2026-11-10/sc-components-platform/`](https://github.com/simple-container-com/forge/tree/main/docs/design/2026-11-10/sc-components-platform/).
 Read it before working on this repo. §P1 explains the Path A sidecar
 wrapper (Schema-advertised component types + `.Raw`-reading, NOT Go
@@ -57,15 +105,17 @@ no external services.
 ## Status
 
 - Repo scaffolded 2026-11-11.
-- Slice 1a (the SC core-side changes this plugin needs — Schema+Raw
-  dispatch + `ComponentConfig` reader) is still owed from
-  `simple-container-com/api`. Plugin binary builds + schema stubs are
-  ready; the runtime handshake with SC core won't do anything useful
-  until the api PR lands.
-- Smoke rig TBD pending host-3 allocation from sc-ru-clouds's VPS fleet
-  (coord via Smecsia). Plan: byo-VM with `ingress.enable: false` + high
-  port HTTP; tar.gz plugin delivery; locally-built service image loaded
-  on the host via `docker load`.
+- Slice 1a (Schema+Raw dispatch + the `ComponentConfig` reader) landed in
+  `simple-container-com/api`; the service is deployed at
+  `notify.simple-forge.com` and its operator login + tenants gate are
+  smoked end to end.
+- `uses:` on a sibling **Component** (as opposed to a `client.yaml`
+  service) needs an `api` core change and is not in a release yet — see
+  `forge/docs/design/2026-11-23/component-uses-wiring/`. Until it lands,
+  only a deploying service can be a consumer.
+- **No publisher has sent a real event yet.** The tenants table reads
+  `count: 0`; the end-to-end smoke (force a backup failure, assert the
+  Telegram message, assert the `Delivery` row) is still owed.
 - Service image Dockerhub publish gated on operator sign-off (CLAUDE.md
   "package publishing, registries or release pipelines" ratchet).
 

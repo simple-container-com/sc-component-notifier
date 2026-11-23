@@ -12,6 +12,7 @@ import (
 
 	"github.com/simple-container-com/sc-component-notifier/service/internal/channel"
 	"github.com/simple-container-com/sc-component-notifier/service/internal/events"
+	"github.com/simple-container-com/sc-component-notifier/service/internal/tenant"
 )
 
 // RouteSource supplies the routing rules in force. Satisfied by
@@ -40,7 +41,10 @@ type IngestResponse struct {
 // the token's tenant claim and OVERWRITES any `source` in the body — a
 // publisher cannot attribute an event to another publisher, and the
 // field is documented as server-filled rather than silently ignored.
-func EventsIngest(store events.Store, router *events.Router, routes RouteSource, now func() time.Time) http.HandlerFunc {
+//
+// `tenants` may be nil, in which case the lazy-registration step below is
+// skipped; every other behaviour is unchanged.
+func EventsIngest(store events.Store, router *events.Router, routes RouteSource, tenants tenant.Store, now func() time.Time) http.HandlerFunc {
 	if now == nil {
 		now = time.Now
 	}
@@ -117,6 +121,24 @@ func EventsIngest(store events.Store, router *events.Router, routes RouteSource,
 			return
 		}
 
+		// Lazy tenant registration. The publisher's plugin tries to
+		// push-register at deploy time, but that call is best-effort by
+		// design — on a first provision the notifier's own Lambda does not
+		// exist yet, so requiring it would deadlock a stack that declares
+		// both the notifier and a publisher. See the call-site comment in
+		// plugin/internal/compute.go.
+		//
+		// This is the path that makes the row appear regardless. The
+		// `tenant` claim is already authenticated and is already the
+		// authority for `ev.Source` two dozen lines up, so creating a row
+		// from it grants nothing the caller did not already have.
+		//
+		// Bookkeeping NEVER fails an ingest: a publisher that cannot be
+		// recorded in the tenant list can still be delivering the alert
+		// that matters, and losing the alert to fix the list is the wrong
+		// trade. Errors warn.
+		ensureTenant(r.Context(), tenants, ev.Source, receipt)
+
 		rules, err := routes.Routes(r.Context())
 		if err != nil {
 			slog.Error("resolve routes failed", "eventId", ev.ID, "err", err)
@@ -152,6 +174,49 @@ func EventsIngest(store events.Store, router *events.Router, routes RouteSource,
 			EventID:   ev.ID,
 			Decisions: decisions,
 		})
+	}
+}
+
+// ensureTenant records that `stackName` is alive, creating the row if the
+// publisher never managed to push-register.
+//
+// Also refreshes LastSeenAt on an existing row, which is the field that
+// makes the SPA's tenant list worth reading: without it a publisher's
+// "last seen" is its last DEPLOY, not its last sign of life, and a
+// publisher that has gone quiet looks identical to one that is healthy
+// and simply has nothing to report.
+//
+// A soft-deleted tenant that publishes is revived, and says so in the
+// log. The alternative — a publisher that is demonstrably alive and
+// sending, but invisible in the operator's list — is worse than a row
+// that came back.
+//
+// Every failure path here warns and returns. Nothing in this function may
+// affect the response.
+func ensureTenant(ctx context.Context, store tenant.Store, stackName string, at time.Time) {
+	if store == nil || stackName == "" {
+		return
+	}
+
+	existing, found, err := store.Get(ctx, stackName)
+	if err != nil {
+		slog.Warn("tenant lookup failed; event unaffected", "stackName", stackName, "err", err)
+		return
+	}
+
+	record := existing
+	switch {
+	case !found:
+		record = tenant.Record{StackName: stackName, CreatedAt: at}
+		slog.Info("tenant auto-registered from its first event", "stackName", stackName)
+	case existing.SoftDeleted:
+		record.SoftDeleted = false
+		slog.Info("tenant revived: soft-deleted but publishing", "stackName", stackName)
+	}
+	record.LastSeenAt = at
+
+	if err := store.Upsert(ctx, record); err != nil {
+		slog.Warn("tenant upsert failed; event unaffected", "stackName", stackName, "err", err)
 	}
 }
 
