@@ -32,11 +32,10 @@ import (
 const (
 	maxAttempts        = 3
 	attemptTimeout     = 10 * time.Second
-	jwtLifetime        = 60 * time.Second
+	registerJWTTTL     = 60 * time.Second
 	userAgent          = "sc-component-notifier/0.0.1 (+https://github.com/simple-container-com/sc-component-notifier)"
-	signingKeyEnvVar   = "NOTIFIER_SIGNING_KEY" // on plugin side, from Provision inputs
-	backupAgentURLVar  = "NOTIFY_URL"           // injected into consumer's env (plain)
-	backupTokenVar     = "NOTIFY_TOKEN"         // injected into consumer's env (secret, per-consumer)
+	notifyURLVar       = "NOTIFY_URL"   // injected into the publisher's env (plain)
+	notifyTokenVar     = "NOTIFY_TOKEN" // injected into the publisher's env (secret)
 	tenantsRegisterURL = "/api/v1/tenants/register"
 )
 
@@ -77,12 +76,12 @@ func NewProcessor(cfg ProcessorConfig) *Processor {
 // (`signingKey`); for the notifier's purposes we expect the test harness to
 // pass it via the DependencyOutputsJson or an env var in the plugin
 // binary's process.
-func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInput, collector pApi.ComputeContextCollector, _ pApi.ProvisionParams) (*api.ResourceOutput, error) {
+func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInput, collector pApi.ComputeContextCollector, params pApi.ProvisionParams) (*api.ResourceOutput, error) {
 	resName := input.Descriptor.Name
 	resType := input.Descriptor.Type
 	stackName := input.StackParams.StackName
 
-	serviceURL, err := p.readServiceURL(input)
+	serviceURL, err := p.readServiceURL(input, params)
 	if err != nil {
 		return nil, errors.Wrapf(err, "component %q unable to resolve service URL", resName)
 	}
@@ -91,9 +90,13 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 		return nil, errors.Wrapf(err, "component %q unable to resolve signingKey", resName)
 	}
 
-	tenantToken, err := mintJWT(signingKey, stackName, jwtLifetime)
+	registerToken, err := mintRegisterJWT(signingKey, stackName, registerJWTTTL)
 	if err != nil {
-		return nil, errors.Wrap(err, "mint per-consumer JWT")
+		return nil, errors.Wrap(err, "mint the registration JWT")
+	}
+	eventToken, err := mintEventJWT(signingKey, stackName)
+	if err != nil {
+		return nil, errors.Wrap(err, "mint the publisher's event JWT")
 	}
 
 	record := TenantRecord{
@@ -102,7 +105,7 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 		Resources: readConsumerResources(input),
 	}
 
-	if err := p.pushRegister(ctx.Context(), serviceURL, tenantToken, record); err != nil {
+	if err := p.pushRegister(ctx.Context(), serviceURL, registerToken, record); err != nil {
 		// The consumer's deploy fails, with a diagnosable error naming
 		// the component as the blocker (per §P3 non-silent-skip rule).
 		return nil, errors.Wrapf(err,
@@ -110,10 +113,17 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 			resName, maxAttempts, serviceURL)
 	}
 
-	// On success, inject BACKUP_AGENT_URL (plain) + BACKUP_TOKEN (secret,
-	// per-consumer short-TTL JWT) into the consumer's compute env.
-	collector.AddEnvVariableIfNotExist(backupAgentURLVar, serviceURL, resType, resName, stackName)
-	collector.AddSecretEnvVariableIfNotExist(backupTokenVar, tenantToken, resType, resName, stackName)
+	// On success, inject the publisher's runtime wiring: where to send
+	// (plain) and what to send it with (secret).
+	//
+	// NOTE the two tokens are NOT the same credential. The registration
+	// token above lives for 60 seconds and is spent by this plugin
+	// within one of them. The token injected here is the one the
+	// PUBLISHER'S OWN CODE presents on every POST /api/v1/events for as
+	// long as that deploy is live — see mintEventJWT for why it carries
+	// no expiry.
+	collector.AddEnvVariableIfNotExist(notifyURLVar, serviceURL, resType, resName, stackName)
+	collector.AddSecretEnvVariableIfNotExist(notifyTokenVar, eventToken, resType, resName, stackName)
 
 	if p.cfg.Progress != nil {
 		p.cfg.Progress.Info("compute-process", fmt.Sprintf("registered tenant %q at %s", stackName, serviceURL))
@@ -224,60 +234,6 @@ func truncate(s string, limit int) string {
 	return s[:limit] + "…"
 }
 
-// readServiceURL reads the deployed service URL. In slice 1a's Path A,
-// SC core populates this via DependencyOutputsJson._deployed_service.
-// For the pre-slice-1a smoke, the plugin's test harness passes it via
-// the resource's own Config.Raw["_test_service_url"] override.
-func (p *Processor) readServiceURL(input api.ResourceInput) (string, error) {
-	// TODO slice 1a: once SC core's sidecar wrapper populates
-	// DependencyOutputsJson._deployed_service, read from there.
-	// For now, read from the plugin's own Config.Raw["_test_service_url"]
-	// — a test-only override.
-	if raw, ok := extractConfigRaw(input.Descriptor); ok {
-		if v, ok := raw["_test_service_url"].(string); ok && v != "" {
-			return v, nil
-		}
-	}
-	return "", errors.New("service URL not in DependencyOutputsJson._deployed_service (slice 1a not yet landed) and no _test_service_url override on Config.Raw")
-}
-
-func (p *Processor) readSigningKey(input api.ResourceInput) (string, error) {
-	if raw, ok := extractConfigRaw(input.Descriptor); ok {
-		if v, ok := raw["signingKey"].(string); ok && v != "" {
-			return v, nil
-		}
-	}
-	return "", errors.New("signingKey not found on Config.Raw — operator must declare config.signingKey: ${secret:...}")
-}
-
-// extractConfigRaw reads the opaque PluginFieldConfig.Raw map off a
-// resource descriptor. Returns nil + false if the shape is unexpected
-// (shouldn't happen in production — slice 1a's parse-time validation
-// catches it earlier — but we guard defensively here).
-func extractConfigRaw(desc *api.ResourceDescriptor) (map[string]any, bool) {
-	// desc.Config (embedded) carries .Config as `any`. In production,
-	// that's *api.PluginFieldConfig with .Raw populated.
-	if desc == nil || desc.Config.Config == nil {
-		return nil, false
-	}
-	type rawHaver interface {
-		GetRaw() map[string]any
-	}
-	if rh, ok := desc.Config.Config.(rawHaver); ok {
-		return rh.GetRaw(), true
-	}
-	// Direct access on *api.PluginFieldConfig via reflection-free field read.
-	type rawField interface {
-		GetRaw() map[string]any
-	}
-	_ = rawField(nil)
-	// Last-resort: check for a plain map[string]any (tests, dev).
-	if m, ok := desc.Config.Config.(map[string]any); ok {
-		return m, true
-	}
-	return nil, false
-}
-
 // deriveConsumerVersion picks a stable version string for idempotency.
 // In production, this is the consumer's deployed image version;
 // pre-slice-1a-wired, we use the resource name as the version marker.
@@ -293,16 +249,66 @@ func readConsumerResources(_ api.ResourceInput) []TenantResource {
 	return []TenantResource{}
 }
 
-// mintJWT creates a short-TTL HS256 JWT for the tenant record. Signing
-// key is the operator's `config.signingKey` secret value, the same key
-// the service was deployed with (as SERVICE_JWT_SECRET env).
-func mintJWT(signingKey, tenant string, lifetime time.Duration) (string, error) {
+// mintRegisterJWT creates the short-TTL HS256 token that authorises the
+// push-register call below. Signing key is the operator's
+// `config.signingKey` secret value, the same key the service was
+// deployed with (as SERVICE_JWT_SECRET env).
+//
+// 60 seconds is generous: this plugin spends the token itself, in the
+// next few hundred milliseconds, and the retry loop's whole budget is
+// bounded well inside it.
+func mintRegisterJWT(signingKey, tenant string, lifetime time.Duration) (string, error) {
 	now := time.Now().UTC()
 	claims := jwt.MapClaims{
 		"op":     "register",
 		"tenant": tenant,
 		"iat":    now.Unix(),
 		"exp":    now.Add(lifetime).Unix(),
+		"nbf":    now.Unix(),
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return tok.SignedString([]byte(signingKey))
+}
+
+// mintEventJWT creates the token the PUBLISHER keeps, and presents on
+// every POST /api/v1/events.
+//
+// It carries NO `exp`, deliberately, and that is the one place this
+// component departs from "every token is short-lived".
+//
+// The token is minted at the publisher's DEPLOY time and injected into
+// its environment. Nothing re-mints it afterwards — there is no refresh
+// endpoint and no sidecar — so any finite expiry becomes the date on
+// which that publisher silently stops being able to alert anyone. A
+// service that was deployed once and has run happily since is the
+// NORMAL case in this fleet, and it is also exactly the case where an
+// alert matters most. "Your alerting went quiet eleven months after the
+// last deploy" is the single worst failure this component could ship.
+//
+// What makes it acceptable is that the token is narrow, not that it is
+// short-lived:
+//
+//   - `op: "event"` is checked by the ingest handler and NOTHING else
+//     accepts it. It cannot register a publisher, cannot drive the
+//     delivery drain, cannot read or write channels.
+//   - `tenant` is the publisher's own stack name, and the ingest
+//     handler takes the event's `source` from this claim rather than
+//     from the request body — so holding one publisher's token lets you
+//     forge events as that publisher and no other, which is also what
+//     a channel's `sources:` allowlist is checked against.
+//   - Rotating `signingKey` invalidates every one of these at once,
+//     which is the revocation story for all five token shapes here.
+//
+// The exposure, stated plainly: whoever can read the publisher's
+// environment can post events as that publisher until the key rotates.
+// They cannot read anything, and the blast radius is noise on a channel
+// an operator is already watching.
+func mintEventJWT(signingKey, tenant string) (string, error) {
+	now := time.Now().UTC()
+	claims := jwt.MapClaims{
+		"op":     "event",
+		"tenant": tenant,
+		"iat":    now.Unix(),
 		"nbf":    now.Unix(),
 	}
 	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -325,25 +331,12 @@ type TenantResource struct {
 	Connection map[string]string `json:"connection,omitempty"`
 }
 
-// ReadDeployedServiceURL reads the Path A sidecar wrapper's populated
-// `_deployed_service` key off DependencyOutputsJson. Returns empty + false
-// if the key is absent (pre-slice-1a SC core).
-func ReadDeployedServiceURL(depOutputsJSON []byte) (string, bool) {
-	if len(depOutputsJSON) == 0 {
-		return "", false
-	}
-	var m map[string]any
-	if err := json.Unmarshal(depOutputsJSON, &m); err != nil {
-		return "", false
-	}
-	if v, ok := m["_deployed_service"].(string); ok && v != "" {
-		return v, true
-	}
-	// Alternate key the dispatched template might populate:
-	if ds, ok := m["_deployed_service"].(map[string]any); ok {
-		if v, ok := ds["url"].(string); ok && v != "" {
-			return v, true
-		}
-	}
-	return "", false
-}
+// The pre-slice-1a `ReadDeployedServiceURL(depOutputsJSON []byte)`
+// helper that used to live here is gone. It parsed the raw
+// DependencyOutputsJson looking for `_deployed_service`, which was the
+// scaffold's placeholder for a URL the plugin had no other way to
+// learn. readServiceURL in config.go supersedes it: SC core hands the
+// decoded sibling outputs to the processor through
+// ProvisionParams.ResourceOutputs, and the `ingress.hostname` fallback
+// covers the consumer-side ComputeProcess path, where core populates no
+// dependency outputs at all.

@@ -24,8 +24,18 @@ Three failure modes this harness reports, which are easy to confuse:
                 test: it burns the whole CI timeout and reports
                 nothing. Fix the test's synchronisation.
 
-Two real test defects were found this way on 2026-11-23, and neither was
-visible from a green run:
+It covers BOTH the service and plugin modules (see MODULES). The plugin
+half earns its place: the `plugin/dependency outputs read off the
+pointer, not .Ref` entry encodes a branch that was dead in TWO shipped
+components — lookupDepString type-asserted an `*api.ResourceOutput`
+struct pointer against `map[string]any`, which can never match, so the
+most-trustworthy branch of the service-URL cascade was unreachable and
+everything silently fell back to `ingress.hostname`. No test went red,
+because no test built a dependency-output fixture the way the plugin bus
+builds one.
+
+Three real test/code defects were found this way on 2026-11-23, and none
+was visible from a green run:
 
   * TestMissingCredentialsArePermanent reached the REAL api.telegram.org
     (apiBase was never redirected) and passed only because the live API
@@ -35,6 +45,10 @@ visible from a green run:
     raw-body fallback rather than its JSON parse, so gutting the parse
     changed nothing. Now it also asserts no raw JSON leaks into the
     message.
+  * normalizeURL trimmed slashes BEFORE whitespace, so a value with a
+    trailing space kept its trailing slash and every event POST would
+    have gone to `//api/v1/events`. Caught by TestNormalizeURL's first
+    run, and kept honest by the `URL trimmed in the wrong order` entry.
 
 One thing to watch for when ADDING a mutation: where a guard is
 deliberately layered, breaking one layer proves nothing because the other
@@ -58,7 +72,13 @@ import subprocess
 import sys
 import tempfile
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent / "service"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# The repo is three Go modules and the guards worth mutating live in two
+# of them. File paths below are REPO-relative and their first segment
+# names the module, which is also the directory `go test` runs in — a
+# plugin mutation tested from service/ would simply not find the package.
+MODULES = ("service", "plugin")
 
 EVENTS = "./internal/events/"
 TG_PKG = "./internal/channel/telegram/"
@@ -67,20 +87,26 @@ CRYPTO_PKG = "./internal/crypto/"
 REG_PKG = "./internal/registry/"
 API_PKG = "./internal/api/"
 TENANT_PKG = "./internal/tenant/"
+PLUGIN_PKG = "./internal/"
 
-ROUTER = "internal/events/router.go"
-DRAIN = "internal/events/drain.go"
-BLOB = "internal/events/store_blob.go"
-CHANNEL = "internal/channel/channel.go"
-ERRORS = "internal/channel/errors.go"
-HTTPC = "internal/channel/http.go"
-TG = "internal/channel/telegram/telegram.go"
-WH = "internal/channel/webhook/webhook.go"
-SEAL = "internal/crypto/seal.go"
-REG = "internal/registry/registry.go"
-TENANT = "internal/tenant/store_blob.go"
-INGEST = "internal/api/events_ingest.go"
-TICK = "internal/api/scheduler_tick.go"
+ROUTER = "service/internal/events/router.go"
+DRAIN = "service/internal/events/drain.go"
+BLOB = "service/internal/events/store_blob.go"
+CHANNEL = "service/internal/channel/channel.go"
+ERRORS = "service/internal/channel/errors.go"
+HTTPC = "service/internal/channel/http.go"
+TG = "service/internal/channel/telegram/telegram.go"
+WH = "service/internal/channel/webhook/webhook.go"
+SEAL = "service/internal/crypto/seal.go"
+REG = "service/internal/registry/registry.go"
+TENANT = "service/internal/tenant/store_blob.go"
+INGEST = "service/internal/api/events_ingest.go"
+TICK = "service/internal/api/scheduler_tick.go"
+
+PLG_CONFIG = "plugin/internal/config.go"
+PLG_CHANNELS = "plugin/internal/channels_cfg.go"
+PLG_TENANTENV = "plugin/internal/tenant_env.go"
+PLG_COMPUTE = "plugin/internal/compute.go"
 
 # (group, name, file, test-package, find, replace, test-regex, occurrences)
 MUTATIONS = [
@@ -451,12 +477,145 @@ MUTATIONS = [
      "\t\tres, err := drainer.Drain(r.Context())\n\t\tif err != nil {",
      "\t\tres, err := drainer.Drain(r.Context())\n\t\tif err != nil && false {",
      "TestDeliveryTick_DrainErrorIs500", 1),
+
+    # ---------------------------------------------------------------- plugin
+    # The dead branch, restored as a mutation. Before 2026-11-23
+    # lookupDepString asserted the *api.ResourceOutput POINTER against
+    # map[string]any — a struct pointer can never satisfy a map type, so
+    # the first (most trustworthy) branch of readServiceURL's cascade was
+    # unreachable and a live `_endpoint_url` was always ignored in favour
+    # of `ingress.hostname`. Nothing went red, because no test built a
+    # dependency-output fixture the way the bus builds one. This entry
+    # exists so re-introducing the same assertion cannot go unnoticed.
+    ("plugin", "dependency outputs read off the pointer, not .Ref", PLG_CONFIG, PLUGIN_PKG,
+     "\t\tswitch ref := out.Ref.(type) {\n\t\tcase *api.PluginResourceOutput:",
+     "\t\tswitch ref := any(out).(type) {\n\t\tcase *api.PluginResourceOutput:",
+     "TestDependencyEndpointURLWinsOverIngressHostname", 1),
+
+    # Trimming slashes BEFORE whitespace is a no-op on a value with a
+    # trailing space, so `"https://host/ "` kept its slash and every
+    # event POST would go to `//api/v1/events`. This was the shipped
+    # order until TestNormalizeURL caught it on its first run.
+    ("plugin", "URL trimmed in the wrong order", PLG_CONFIG, PLUGIN_PKG,
+     's = strings.TrimRight(strings.TrimSpace(s), "/")',
+     's = strings.TrimSpace(strings.TrimRight(s, "/"))',
+     "TestNormalizeURL", 1),
+
+    # The worst available outcome: a publisher that deploys green with
+    # notifications pointing nowhere. Nobody finds out until the
+    # incident, which is the whole reason this component exists.
+    ("plugin", "unresolvable service URL defaults instead of failing", PLG_CONFIG, PLUGIN_PKG,
+     '\treturn "", errors.New(\n'
+     '\t\t"cannot resolve the notifier service URL: no `_endpoint_url`/`_deployed_service` in the dependency outputs '
+     'and no `config.ingress.hostname` on the component",\n\t)',
+     '\treturn "https://notifier.invalid", nil',
+     "TestUnresolvableServiceURLFailsAndNamesBothOptions", 1),
+
+    ("plugin", "blank signingKey accepted", PLG_CONFIG, PLUGIN_PKG,
+     '\tif v, ok := configRaw(input)["signingKey"].(string); ok && v != "" {',
+     '\tif v, ok := configRaw(input)["signingKey"].(string); ok || v == "" {',
+     "TestSigningKeyIsRequired", 1),
+
+    # A single hyphen collides with a resource name that itself ends in
+    # `-staging`: the component would then read and write a bucket
+    # belonging to something else.
+    ("plugin", "bucket separator single hyphen", PLG_CONFIG, PLUGIN_PKG,
+     '\treturn resourceName + "--" + env',
+     '\treturn resourceName + "-" + env',
+     "TestResourceBucketNameUsesTheDoubleHyphenSeparator", 1),
+
+    # `cooldown: 900` arrives as a float64 after the bus's JSON
+    # round-trip. Rendering it with %v gives "900" with no unit, and the
+    # service's duration parse then exits 2 at boot — the notifier never
+    # starts, which is the one outcome worse than a missed alert.
+    ("plugin", "bare-number cooldown rendered without a unit", PLG_CONFIG, PLUGIN_PKG,
+     '\t\treturn fmt.Sprintf("%ds", int64(v))',
+     '\t\treturn fmt.Sprintf("%v", v)',
+     "TestCooldownFromConfigRendersADurationStringFromEveryYAMLShape", 1),
+
+    ("plugin", "unresolved placeholder passed through", PLG_CHANNELS, PLUGIN_PKG,
+     "\t\tif err := rejectUnresolved(ch); err != nil {\n\t\t\treturn \"\", nil, err\n\t\t}",
+     "\t\tif err := rejectUnresolved(ch); err != nil && false {\n\t\t\treturn \"\", nil, err\n\t\t}",
+     "TestUnresolvedPlaceholderFailsTheProvision", 1),
+
+    # A SecretsManager ARN contains no placeholder marker, but a marker
+    # list that grew an over-broad entry would start rejecting it — and
+    # the ARN form is the only one that keeps a bot token out of the
+    # function's environment.
+    ("plugin", "ARN credentials rejected as placeholders", PLG_CHANNELS, PLUGIN_PKG,
+     'var unresolvedMarkers = []string{"${secret:", "${resource:", "$$sc:", "${auth:"}',
+     'var unresolvedMarkers = []string{"${secret:", "${resource:", "$$sc:", "${auth:", "arn:"}',
+     "TestSecretARNIsAcceptedAndClassified", 1),
+
+    ("plugin", "duplicate channel names allowed", PLG_CHANNELS, PLUGIN_PKG,
+     "\t\tif _, dup := seen[ch.Name]; dup {",
+     "\t\tif _, dup := seen[ch.Name]; dup && false {",
+     "TestInvalidChannelFailsRatherThanDeployingQuietly", 1),
+
+    ("plugin", "invalid channel deployed quietly", PLG_CHANNELS, PLUGIN_PKG,
+     "\t\tif err := ch.Validate(); err != nil {\n\t\t\treturn \"\", nil, err\n\t\t}",
+     "\t\tif err := ch.Validate(); err != nil && false {\n\t\t\treturn \"\", nil, err\n\t\t}",
+     "TestInvalidChannelFailsRatherThanDeployingQuietly", 1),
+
+    # Resolving the default here would put the same rule in two places;
+    # the day they disagree, an operator's channel changes behaviour on a
+    # plugin upgrade they did not ask for.
+    ("plugin", "minSeverity resolved in the plugin, not the service", PLG_CHANNELS, PLUGIN_PKG,
+     "\tout, err := json.Marshal(channels)",
+     "\tfor i := range channels {\n\t\tchannels[i].MinSeverity = channels[i].ResolvedMinSeverity()\n\t}\n"
+     "\tout, err := json.Marshal(channels)",
+     "TestBlankMinSeverityIsNotResolvedIntoThePayload", 1),
+
+    # Prefix matching would admit `staging-ru` — a real and separate
+    # environment here — and, worse, a workflow-id stack on any operator
+    # whose environment name happens to be a prefix of it.
+    ("plugin", "environment allowlist matches by prefix", PLG_TENANTENV, PLUGIN_PKG,
+     "\t\tif strings.TrimSpace(a) == env {",
+     "\t\tif strings.HasPrefix(env, strings.TrimSpace(a)) {",
+     "TestAllowlistMatchesExactlyNotByPrefix", 1),
+
+    ("plugin", "empty allowlist locks everything out", PLG_TENANTENV, PLUGIN_PKG,
+     "\tif len(allowed) == 0 {\n\t\treturn true\n\t}",
+     "\tif len(allowed) == 0 {\n\t\treturn false\n\t}",
+     "TestEmptyAllowlistAllowsEveryEnvironment", 1),
+
+    # A typo'd entry must not become a filter that excludes everything:
+    # that turns one character into "no publisher anywhere registers",
+    # with no error and no alert.
+    ("plugin", "non-string allowlist entry becomes a blank entry", PLG_TENANTENV, PLUGIN_PKG,
+     '\t\t\tif s, ok := item.(string); ok && strings.TrimSpace(s) != "" {\n'
+     "\t\t\t\tout = append(out, strings.TrimSpace(s))\n\t\t\t}",
+     "\t\t\ts, _ := item.(string)\n\t\t\tout = append(out, strings.TrimSpace(s))",
+     "TestNonStringEntriesAreSkippedNotFatal", 1),
+
+    # The publisher's event token is minted once at deploy time and
+    # nothing re-mints it. An `exp` here is the date that publisher's
+    # alerting goes quiet — and "add an exp like every other token" is
+    # exactly the well-meaning edit that would do it.
+    ("plugin", "publisher event token given an expiry", PLG_COMPUTE, PLUGIN_PKG,
+     '\t\t"op":     "event",\n\t\t"tenant": tenant,\n\t\t"iat":    now.Unix(),\n\t\t"nbf":    now.Unix(),',
+     '\t\t"op":     "event",\n\t\t"tenant": tenant,\n\t\t"iat":    now.Unix(),\n'
+     '\t\t"exp":    now.Add(24 * time.Hour).Unix(),\n\t\t"nbf":    now.Unix(),',
+     "TestMintEventJWTNeverExpires", 1),
+
+    ("plugin", "event token minted with the register op", PLG_COMPUTE, PLUGIN_PKG,
+     '\t\t"op":     "event",', '\t\t"op":     "register",',
+     "TestMintEventJWTNeverExpires", 1),
+
+    # A 401/403 on registration means the signing key does not match the
+    # deployed service's. Retrying it three times buries the one error
+    # message that names the actual fault.
+    ("plugin", "4xx retried like a transient failure", PLG_COMPUTE, PLUGIN_PKG,
+     "\t\tif status >= 400 && status < 500 && status != 429 {",
+     "\t\tif false {",
+     "TestPushRegister_NonRetryable4xx", 1),
 ]
 
 TEST_FILE_PREFIXES = (
     "drain_test.go:", "router_test.go:", "store_blob_test.go:",
     "telegram_test.go:", "webhook_test.go:", "seal_test.go:", "store_blob_test.go:",
     "registry_test.go:", "events_ingest_test.go:", "scheduler_tick_test.go:",
+    "config_test.go:", "channels_cfg_test.go:", "tenant_env_test.go:", "compute_test.go:",
 )
 COMPILE_MARKERS = ("build failed", "undefined:", "declared and not used", "cannot use")
 
@@ -501,13 +660,18 @@ def main() -> int:
         return 0
 
     backup = pathlib.Path(tempfile.mkdtemp(prefix="mutation-check-"))
-    shutil.copytree(ROOT / "internal", backup / "internal")
+    for mod in MODULES:
+        shutil.copytree(ROOT / mod / "internal", backup / mod / "internal")
 
     problems = []
     try:
         for group, name, rel, pkg, find, repl, test, want in muts:
             label = f"{group}/{name}"
             path = ROOT / rel
+            # The module the file belongs to is also the directory the
+            # test has to run in: each module has its own go.mod, so
+            # `go test ./internal/` resolves differently per module.
+            module = ROOT / rel.split("/", 1)[0]
             src = path.read_text()
             if src.count(find) != want:
                 print(f"STALE       {label}")
@@ -520,7 +684,7 @@ def main() -> int:
             try:
                 proc = subprocess.run(
                     ["go", "test", pkg, "-count=1", "-run", test],
-                    cwd=ROOT, capture_output=True, text=True, timeout=180,
+                    cwd=module, capture_output=True, text=True, timeout=180,
                 )
             except subprocess.TimeoutExpired:
                 print(f"HUNG        {label}")
@@ -549,8 +713,9 @@ def main() -> int:
     finally:
         # Belt and braces: restore everything, so a crash or a Ctrl-C
         # mid-run cannot leave a mutated file behind.
-        shutil.rmtree(ROOT / "internal")
-        shutil.copytree(backup / "internal", ROOT / "internal")
+        for mod in MODULES:
+            shutil.rmtree(ROOT / mod / "internal")
+            shutil.copytree(backup / mod / "internal", ROOT / mod / "internal")
         shutil.rmtree(backup, ignore_errors=True)
 
     print()

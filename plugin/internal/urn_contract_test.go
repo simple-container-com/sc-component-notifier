@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
-
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )

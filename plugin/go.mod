@@ -9,7 +9,7 @@ require (
 	github.com/onsi/gomega v1.44.0
 	github.com/pkg/errors v0.9.1
 	github.com/pulumi/pulumi/sdk/v3 v3.245.0
-	github.com/simple-container-com/api v0.0.0-20261111190836-60bb46dc2d06
+	github.com/simple-container-com/api v0.0.0-20261119091249-49facf7520b2
 	github.com/simple-container-com/sc-component-notifier/api v0.0.0
 )
 
@@ -149,6 +149,7 @@ require (
 	gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
+	gotest.tools/v3 v3.5.0 // indirect
 	lukechampine.com/frand v1.5.1 // indirect
 )
 

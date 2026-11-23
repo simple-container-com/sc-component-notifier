@@ -6,9 +6,11 @@ package notifier
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
+	"github.com/golang-jwt/jwt/v5"
 	. "github.com/onsi/gomega"
 )
 
@@ -101,34 +103,50 @@ func TestPushRegister_NonRetryable4xx(t *testing.T) {
 	Expect(atomic.LoadInt32(&hits)).To(Equal(int32(1)), "403 must NOT retry (only 4xx-except-429 are non-retryable)")
 }
 
-func TestMintJWT(t *testing.T) {
-	RegisterTestingT(t)
+const testSigningKey = "a-fake-signing-key-that-is-at-least-32-bytes-long"
 
-	tok, err := mintJWT("a-fake-signing-key-that-is-at-least-32-bytes-long", "my-consumer-stack", 60)
+// claimsOf parses a token WITHOUT validating time claims, so an
+// expiry-related assertion below reads the value rather than being
+// pre-empted by the parser rejecting it.
+func claimsOf(t *testing.T, tok string) jwt.MapClaims {
+	t.Helper()
+	claims := jwt.MapClaims{}
+	_, err := jwt.NewParser(jwt.WithValidMethods([]string{"HS256"}), jwt.WithoutClaimsValidation()).
+		ParseWithClaims(tok, claims, func(*jwt.Token) (any, error) { return []byte(testSigningKey), nil })
 	Expect(err).ToNot(HaveOccurred())
-	Expect(tok).ToNot(BeEmpty())
-	// HS256 JWTs are 3 base64url segments separated by dots.
-	segments := 0
-	for _, c := range tok {
-		if c == '.' {
-			segments++
-		}
-	}
-	Expect(segments).To(Equal(2))
+	return claims
 }
 
-func TestReadDeployedServiceURL(t *testing.T) {
+func TestMintRegisterJWT(t *testing.T) {
 	RegisterTestingT(t)
 
-	v, ok := ReadDeployedServiceURL([]byte(`{"_deployed_service":"https://notifier.example.com"}`))
-	Expect(ok).To(BeTrue())
-	Expect(v).To(Equal("https://notifier.example.com"))
+	tok, err := mintRegisterJWT(testSigningKey, "my-publisher-stack", registerJWTTTL)
+	Expect(err).ToNot(HaveOccurred())
+	// HS256 JWTs are 3 base64url segments separated by dots.
+	Expect(strings.Count(tok, ".")).To(Equal(2))
 
-	v, ok = ReadDeployedServiceURL([]byte(`{}`))
-	Expect(ok).To(BeFalse())
-	Expect(v).To(BeEmpty())
+	claims := claimsOf(t, tok)
+	Expect(claims["op"]).To(Equal("register"), "the registration token must not be usable to ingest events")
+	Expect(claims["tenant"]).To(Equal("my-publisher-stack"))
+	Expect(claims).To(HaveKey("exp"), "the registration token is spent within a second and must expire")
+}
 
-	v, ok = ReadDeployedServiceURL(nil)
-	Expect(ok).To(BeFalse())
-	Expect(v).To(BeEmpty())
+// The publisher's event token must carry NO expiry. A finite one is the
+// date the publisher silently stops being able to alert anyone — see
+// mintEventJWT's doc comment for the full reasoning. Asserted here
+// because the fault is invisible for as long as the TTL lasts, and a
+// well-meaning "add an exp like every other token" edit is the exact
+// shape of change that would reintroduce it.
+func TestMintEventJWTNeverExpires(t *testing.T) {
+	RegisterTestingT(t)
+
+	tok, err := mintEventJWT(testSigningKey, "my-publisher-stack")
+	Expect(err).ToNot(HaveOccurred())
+
+	claims := claimsOf(t, tok)
+	Expect(claims["op"]).To(Equal("event"), "the publisher's token must not be able to register or drive the drain")
+	Expect(claims["tenant"]).To(Equal("my-publisher-stack"),
+		"the ingest handler takes the event source from this claim, so it must be the publisher's own stack")
+	Expect(claims).ToNot(HaveKey("exp"),
+		"an expiry here becomes the date this publisher's alerting goes quiet with nothing to re-mint it")
 }
