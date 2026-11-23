@@ -1,0 +1,43 @@
+# Compiled binaries
+/sc-component-notifier
+/plugin/sc-component-notifier
+/service/notifier
+/dist/
+/bin/
+
+# Local SC state + secrets (gitignored per fleet CLAUDE.md — only encrypted
+# .sc/secrets.yaml registries are committed).
+/.sc/state/
+/.sc/stacks/*/secrets.yaml
+/.sc/cfg.github.yaml
+
+# Go
+/plugin/vendor/
+/api/vendor/
+/service/vendor/
+
+# Node
+/service/internal/ui/node_modules/
+
+# NOTE: internal/ui/dist/ is deliberately NOT ignored. The SPA bundle is
+# COMMITTED, because the Dockerfile has no Node stage — the Go binary
+# embeds dist/ with go:embed, and an embed of a missing directory is a
+# compile error, not a warning. sc-component-observatory does the same
+# (it has no .gitignore at all and commits its three dist files). The
+# template this repo was copied from ignored the directory, which would
+# have failed the first image build with a confusing
+# "pattern dist: no matching files found".
+#
+# Consequence to remember: a SPA change needs `make ui` + the rebuilt
+# bundle committed, or the deployed service serves the previous UI while
+# the Go side is new.
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

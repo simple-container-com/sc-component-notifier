@@ -1,0 +1,122 @@
+name: CI
+
+# Why this exists: the component repos were created from a template that
+# shipped only release.yml, so nothing ever ran `go test` on a pull
+# request. A `crypto/rand: argument to Int is <= 0` panic in the
+# template's own retry-backoff helper survived unnoticed into two
+# generations of copies because of it — the test that caught it was
+# already written and already red, and nobody saw it. So: build, vet and
+# test every module on every push and PR.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Three independent Go modules. `go build ./...` at the repo root
+        # does NOT cover them — there is no root module, by design — so
+        # each is built and tested in its own working directory.
+        module: [api, plugin, service]
+    name: ${{ matrix.module }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      - name: go build
+        run: go build ./...
+
+      # `go vet` compiles test packages, which `go build ./...` does not.
+      # That difference is not academic: adding a method to an interface
+      # leaves every fake in a _test.go file unimplementing it, and a
+      # build-only gate ships that happily.
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./... -count=1
+
+      # -race only on the service module: it is the one with concurrency
+      # (the delivery drain's single-flight lease), and it is the one
+      # where a data race would mean duplicate notifications.
+      - name: go test -race
+        if: matrix.module == 'service'
+        run: go test ./... -count=1 -race
+
+  # Asserts the tests actually catch the faults they claim to. See
+  # hack/mutation-check.py — it breaks one guard at a time and requires
+  # the matching test to go red. This is what distinguishes a regression
+  # test from a test that merely agrees with the code as written; it has
+  # already found two tests that passed with their guard removed.
+  mutation-check:
+    runs-on: ubuntu-latest
+    name: mutation check
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: service/go.sum
+
+      # Warm the build cache once, so 31 sequential `go test -run` calls
+      # don't each pay for a cold compile.
+      - name: prime build cache
+        working-directory: service
+        run: go test ./... -count=1 -run XXXNONE
+
+      - name: mutation check
+        run: python3 hack/mutation-check.py
+
+      # A mutation that is written back incorrectly would leave the tree
+      # dirty. Cheap insurance against the harness itself lying.
+      - name: tree restored
+        run: git diff --exit-code
+
+  format:
+    runs-on: ubuntu-latest
+    name: gofumpt
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: install gofumpt
+        run: go install mvdan.cc/gofumpt@latest
+
+      # Advisory, not blocking: this repo has no .golangci.yml, so
+      # gofumpt is a convention here rather than an enforced gate, and
+      # failing a PR on comment alignment would be noise. It prints the
+      # offenders so they get fixed in passing.
+      - name: gofumpt -l
+        continue-on-error: true
+        run: |
+          out=$(gofumpt -l api plugin service)
+          if [ -n "$out" ]; then
+            echo "::warning::unformatted files:"
+            echo "$out"
+            exit 1
+          fi
+          echo "all formatted"
