@@ -4,24 +4,38 @@
 #   1. Node builder — compile the React SPA into service/internal/ui/dist.
 #   2. Go builder — build the Go binary with the SPA embedded via
 #      //go:embed all:dist.
-#   3. Lambda runtime — public.ecr.aws/lambda/provided:al2023 as the
-#      final base; the binary runs under aws-lambda-go's lambda runtime
-#      or as a standalone HTTP server when PORT is set (both shapes work
-#      because go-aws-lambda-sdk's sdkservice detects the environment).
+#   3. Runtime — public.ecr.aws/amazonlinux/amazonlinux:2023, same as
+#      sc-component-observatory. The binary runs under aws-lambda-go's
+#      runtime or as a standalone HTTP server when PORT is set (both
+#      shapes work because go-aws-lambda-sdk's sdkservice detects the
+#      environment).
+#
+# NOT `public.ecr.aws/lambda/provided:al2023`, which is what this file
+# was scaffolded with. Two reasons, in order of how much they cost:
+#
+#   - YC rejects it. Three of its layers begin with a tar entry whose
+#     path is the empty string, and Yandex Cloud answers `Bad path in
+#     image` naming neither the layer nor the entry. The fleet lost a
+#     day to that on forge-atrium.
+#   - It buys nothing. A Go binary that links aws-lambda-go IS its own
+#     runtime interface client, so the RIE and `lambda-entrypoint.sh`
+#     the lambda base exists to provide are dead weight in a deployed
+#     image. Observatory has run on the plain amazonlinux base since it
+#     shipped.
+#
+# Consequence of the swap: the binary lands at /usr/local/bin/notifier
+# with an explicit ENTRYPOINT rather than at /var/task/bootstrap, which
+# only the lambda base's entrypoint would have looked for.
 #
 # Build args:
 #   - VERSION    (auto-injected by SC per fleet CLAUDE.md "How SC builds images")
 #   - COMMIT     (operator-declared under client.yaml image.build.args — see
 #                 sc-auto-inject-github-sha-and-repository-build-args roadmap item)
 #   - REVISION   (same)
-#
-# NO Dockerhub push from this repo's CI — see root CLAUDE.md for why. The
-# `docker build` is run at smoke time (local or on the target VPS) with
-# `docker load` of the resulting image.
 
 ARG GOLANG_VERSION=1.26-alpine
 ARG NODE_VERSION=20-alpine
-ARG RUNTIME_BASE=public.ecr.aws/lambda/provided:al2023
+ARG RUNTIME_BASE=public.ecr.aws/amazonlinux/amazonlinux:2023
 
 # -----------------------------
 # Stage 1 — Build the SPA
@@ -70,18 +84,26 @@ LABEL org.opencontainers.image.title="SC Component Notifier"
 LABEL org.opencontainers.image.source="https://github.com/simple-container-com/sc-component-notifier"
 LABEL org.opencontainers.image.licenses="MIT"
 
+# The plain amazonlinux base ships no CA bundle; every outbound call
+# this service makes is HTTPS (Telegram, operator webhooks, the
+# observatory it registers itself with), so this is not optional.
+RUN dnf install -y ca-certificates \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
 # Russian CA carry-over from forge-notifier — placeholder directory, no
 # certs yet. Real components talking to api.giga.chat / ngw.devices.sberbank.ru
-# add the .crt files here + an update-ca-trust step.
+# add the .crt files here, and this is why update-ca-trust runs after.
 COPY build/ca/ /etc/pki/ca-trust/source/anchors/
+RUN update-ca-trust extract
 
-# The lambda base image's default WORKDIR is /var/task.
-COPY --from=go-builder /out/notifier /var/task/bootstrap
+COPY --from=go-builder /out/notifier /usr/local/bin/notifier
 
-# For plain-HTTP mode (non-Lambda), run directly:
+# For plain-HTTP mode (non-Lambda), run directly. NOTE for a future YC
+# deploy: PORT is RESERVED on a YC Serverless Container and a revision
+# that sets it is refused, so a YC client.yaml must write its env block
+# out in full rather than inheriting one that carries this.
 ENV PORT=8080
 EXPOSE 8080
 
-# Lambda runtime detects provided.al2023 and invokes /var/task/bootstrap.
-# For VM/compose deploys, override with CMD ["/var/task/bootstrap"] in
-# the deploy template's compose file.
+ENTRYPOINT ["/usr/local/bin/notifier"]

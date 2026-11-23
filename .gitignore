@@ -19,18 +19,24 @@
 # Node
 /service/internal/ui/node_modules/
 
-# NOTE: internal/ui/dist/ is deliberately NOT ignored. The SPA bundle is
-# COMMITTED, because the Dockerfile has no Node stage — the Go binary
-# embeds dist/ with go:embed, and an embed of a missing directory is a
-# compile error, not a warning. sc-component-observatory does the same
-# (it has no .gitignore at all and commits its three dist files). The
-# template this repo was copied from ignored the directory, which would
-# have failed the first image build with a confusing
-# "pattern dist: no matching files found".
+# NOTE: internal/ui/dist/ is deliberately NOT ignored. The Go binary
+# embeds it with go:embed, and an embed of a missing directory is a
+# COMPILE error, not a warning — so `go build`, `go test` and CI all
+# need something there even though nobody looks at it. The template
+# this repo was copied from ignored the directory, which fails with a
+# confusing "pattern dist: no matching files found".
 #
-# Consequence to remember: a SPA change needs `make ui` + the rebuilt
-# bundle committed, or the deployed service serves the previous UI while
-# the Go side is new.
+# Unlike sc-component-observatory, which commits a real built bundle
+# and has no Node stage at all, the committed file here is a PLACEHOLDER
+# index.html: service/Dockerfile still builds the SPA in a Node stage
+# and overwrites dist/ with the result. So the deployed UI comes from
+# the Dockerfile, and the committed file exists only to let the Go
+# toolchain compile outside Docker.
+#
+# Collapse this to observatory's arrangement (commit the real bundle,
+# drop the Node stage) when the SPA is worth building — i.e. at slice 3,
+# when it grows past the one Tenants page. Until then, do not read the
+# committed dist as what production serves.
 
 # Editor
 .vscode/

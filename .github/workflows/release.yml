@@ -1,18 +1,24 @@
 name: Release
 
-# Cuts cross-platform PLUGIN binaries + sha256sums for every release.
-# Service image is NOT pushed from this workflow — see root CLAUDE.md
-# "no Dockerhub publish without operator yes". The service image is
-# built locally at smoke time (`make docker` in service/) or via a
-# local `docker build` on the target VPS.
+# Cuts plugin binaries + the service image for every release.
 #
 # Two triggers:
 #   - push to main → auto-release with CalVer "vYYYY.MM.DD-<short-sha>".
 #   - manually-pushed "v*" tag → named release for pinning / rollback.
 #
 # Both paths produce the same artifact set: three PLUGIN binaries
-# (linux/amd64, linux/arm64, darwin/arm64), a sha256sums.txt, and a
-# GitHub Release.
+# (linux/amd64, linux/arm64, darwin/arm64), a sha256sums.txt, a GitHub
+# Release, and a Dockerhub push of the service image.
+#
+# Both halves are required for a deploy: SC pulls the PLUGIN from the
+# GitHub release (`source: {type: github-release}` in server.yaml) and
+# the SERVICE image from Dockerhub by the pin in the Component's
+# `image:` field. A release that produces only one of the two leaves
+# the component un-deployable, which is why they live in one workflow.
+#
+# Dockerhub publish into the shared simplecontainer/* namespace was
+# approved by the operator with this component's plan (2026-11-23),
+# the same way it was for sc-component-observatory.
 #
 # OOM pins (GOMAXPROCS=1, GOMEMLIMIT=6GiB, `go build -p 1`) — kept
 # verbatim from sc-plugin-echo even though sc-component-notifier's plugin
@@ -139,17 +145,64 @@ jobs:
             --generate-notes \
             dist/*
 
-# NOTE — no Dockerhub push step.
-#
-# The sc-component-notifier service image is NOT published from this
-# repo's CI. Per fleet CLAUDE.md "package publishing, registries or
-# release pipelines" — publishing into the shared simplecontainer/*
-# namespace needs explicit operator yes. The service image is built
-# locally at smoke time (service/Makefile's `make docker` target) and
-# loaded onto the target VPS via `docker save` + `scp` + `docker load`
-# OR built on the host from a `git clone` of this repo.
-#
-# When/if the operator approves a Dockerhub publish for this repo, a
-# second workflow (`push-image.yml`) will add the push step. Keeping
-# it out of this release workflow means plugin-binary releases cut
-# cleanly without a cross-concern on the Docker Hub path.
+  # Dockerhub publish. Ported from sc-component-observatory's job,
+  # which is the working reference — including its `if:`, but NOT its
+  # comment: observatory's says "tag push only" and the condition it
+  # sits above fires on main pushes too (`is_tag == 'false'` IS the
+  # main-push branch). The behaviour here is the honest reading of that
+  # condition — every main push republishes the image under a fresh
+  # CalVer pin and moves :latest. That is what we want while the
+  # component is pre-v1 and the operator config pins an exact version
+  # anyway.
+  #
+  # Image name: simplecontainer/sc-component-notifier:<version>, plus
+  # :latest. Builds from the `service/` module and passes VERSION as a
+  # build arg so `-X main.version=<ver>` resolves (fleet convention,
+  # root CLAUDE.md "How SC builds images" — SC always injects VERSION,
+  # so a deployed binary reporting 0.0.0 is a bug, not the norm).
+  docker:
+    name: Push Docker image to Dockerhub
+    runs-on: ubuntu-latest
+    needs: [version, release]
+    if: startsWith(github.ref, 'refs/tags/v') || needs.version.outputs.is_tag == 'false'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fleet-shared Dockerhub login: pulls simplecontainer:dockerhub-cicd-token
+      # from the api repo's SC secrets registry via the single ORG-LEVEL
+      # SC_CONFIG secret (visibility=all, so this repo inherits it with no
+      # per-repo wiring). One place to rotate. Never add a repo-level
+      # SC_CONFIG — it would SHADOW the org value and go stale.
+      - uses: simple-container-com/actions/install-sc@main
+      - uses: simple-container-com/actions/dockerhub-login@main
+        with:
+          sc-config: ${{ secrets.SC_CONFIG }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # `cache-to: mode=max` writes every stage, so a subsequent run
+      # reuses the two slow phases: the SPA's `npm install` and the Go
+      # builder's `go mod download`.
+      #
+      # Platform: amd64 ONLY. arm64 under QEMU emulates the whole Node
+      # build at ~1/10th native speed, and observatory measured ~25 min
+      # for a single multi-arch release. A Lambda deploy picks ONE arch
+      # per function, so emitting both buys nothing today.
+      - name: Build + push image
+        uses: docker/build-push-action@v5
+        with:
+          context: service
+          file: service/Dockerfile
+          platforms: linux/amd64
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ needs.version.outputs.version }}
+            COMMIT=${{ github.sha }}
+            REVISION=${{ github.sha }}
+          tags: |
+            simplecontainer/sc-component-notifier:${{ needs.version.outputs.version }}
+            simplecontainer/sc-component-notifier:latest
