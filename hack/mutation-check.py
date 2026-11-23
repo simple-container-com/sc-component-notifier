@@ -34,7 +34,7 @@ everything silently fell back to `ingress.hostname`. No test went red,
 because no test built a dependency-output fixture the way the plugin bus
 builds one.
 
-Three real test/code defects were found this way on 2026-11-23, and none
+Five real test/code defects were found this way on 2026-11-23, and none
 was visible from a green run:
 
   * TestMissingCredentialsArePermanent reached the REAL api.telegram.org
@@ -49,6 +49,16 @@ was visible from a green run:
     trailing space kept its trailing slash and every event POST would
     have gone to `//api/v1/events`. Caught by TestNormalizeURL's first
     run, and kept honest by the `URL trimmed in the wrong order` entry.
+  * TestEventsIngest_TenantStoreFailureDoesNotFailTheEvent asserted that a
+    tenant-store outage cannot fail an ingest, but its fake failed the
+    LOOKUP — so ensureTenant returned at the lookup warn and the upsert
+    branch was never reached. A panic planted in that branch passed. Now
+    the fake fails either call on demand and the test asserts the exact
+    Get/Upsert call counts, so a test that stops reaching the failing call
+    goes red instead of green. Two entries, one per branch.
+  * TestEventsIngest_SubsequentEventRefreshesLastSeen compared two real
+    wall-clock stamps with `>=`, which holds whether the refresh happened
+    or not. It now runs on an injected clock and asserts the exact value.
 
 One thing to watch for when ADDING a mutation: where a guard is
 deliberately layered, breaking one layer proves nothing because the other
@@ -68,6 +78,7 @@ leave one file mutated, and `git diff` is the check.
 
 import pathlib
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -436,6 +447,48 @@ MUTATIONS = [
      "\t\tif ev.At.IsZero() {", "\t\tif true {",
      "TestEventsIngest_PublisherEventTimeIsPreserved", 1),
 
+    # Lazy registration is what makes push-register safe to fail. Remove it
+    # and a publisher whose deploy-time register call did not land stays
+    # invisible in the operator's tenant list forever, while delivering
+    # alerts perfectly — so nothing anywhere reports the fault.
+    ("ingest", "tenant never created from its first event", INGEST, API_PKG,
+     "\t\tensureTenant(r.Context(), tenants, ev.Source, receipt)",
+     "\t\t_ = ensureTenant",
+     "TestEventsIngest_FirstEventRegistersTheTenant", 1),
+
+    ("ingest", "LastSeenAt never stamped", INGEST, API_PKG,
+     "\trecord.LastSeenAt = at", "\t_ = at",
+     "TestEventsIngest_FirstEventRegistersTheTenant", 1),
+
+    # Stamped on create but never refreshed afterwards — the subtler half,
+    # and the one the SPA's list actually depends on: "last seen" silently
+    # means "last deployed", so a publisher that has gone quiet is
+    # indistinguishable from a healthy one with nothing to say.
+    ("ingest", "LastSeenAt stamped on create only", INGEST, API_PKG,
+     "\trecord.LastSeenAt = at", "\tif !found {\n\t\trecord.LastSeenAt = at\n\t}",
+     "TestEventsIngest_SubsequentEventRefreshesLastSeen", 1),
+
+    ("ingest", "publishing tenant left soft-deleted", INGEST, API_PKG,
+     "\t\trecord.SoftDeleted = false", "\t\trecord.SoftDeleted = true",
+     "TestEventsIngest_SoftDeletedTenantIsRevivedByPublishing", 1),
+
+    # The two halves of "bookkeeping NEVER fails an ingest" get a mutation
+    # each, because a fake that fails the LOOKUP never reaches the upsert:
+    # one mutation cannot prove both paths, and the first version of the
+    # test proved neither (it passed with a panic in the upsert branch).
+    ("ingest", "lookup failure falls through to the upsert", INGEST, API_PKG,
+     '\t\tslog.Warn("tenant lookup failed; event unaffected", "stackName", stackName, "err", err)\n\t\treturn',
+     '\t\tslog.Warn("tenant lookup failed; event unaffected", "stackName", stackName, "err", err)',
+     "TestEventsIngest_TenantStoreFailureDoesNotFailTheEvent", 1),
+
+    # A panic rather than an error return: ensureTenant has no way to
+    # affect the response by design, so the only way to express "the
+    # failure escaped" is to make escaping fatal.
+    ("ingest", "upsert failure reaches the response path", INGEST, API_PKG,
+     '\t\tslog.Warn("tenant upsert failed; event unaffected", "stackName", stackName, "err", err)',
+     '\t\tpanic("bookkeeping failure reached the response path")',
+     "TestEventsIngest_TenantStoreFailureDoesNotFailTheEvent", 1),
+
     # ---------------------------------------------------------------- tenant
     # The sanitiser-vs-hash choice: replacing the offending characters
     # keeps keys readable but collapses two distinct stack names into one
@@ -686,6 +739,84 @@ MUTATIONS = [
      "\t\tif status >= 400 && status < 500 && status != 429 {",
      "\t\tif false {",
      "TestPushRegister_NonRetryable4xx", 1),
+
+    # ------------------------------------------------------- plugin: wiring
+    # The `SC_` prefix is the property that makes auto-injection safe
+    # rather than merely convenient: core refuses an injected name outside
+    # it, so no provider plugin can shadow an application's own NOTIFY_URL
+    # or DATABASE_URL. Dropping the prefix here is the edit that looks like
+    # tidying.
+    ("plugin", "injected env name loses the SC_ prefix", PLG_COMPUTE, PLUGIN_PKG,
+     '\tnotifyURLVar   = "SC_NOTIFY_URL"   // plain',
+     '\tnotifyURLVar   = "NOTIFY_URL"   // plain',
+     "TestProcessInjectsPrefixedWiring", 1),
+
+    # The token is a bearer credential for as long as the deploy lives. As
+    # a plain env var it sits in the function's configuration in the clear
+    # instead of in SecretsManager, and the deploy log reads identically.
+    ("plugin", "event token injected as a plain env var", PLG_COMPUTE, PLUGIN_PKG,
+     "\tcollector.AddSecretEnvVariableIfNotExist(notifyTokenVar, eventToken, resType, resName, stackName)",
+     "\tcollector.AddEnvVariableIfNotExist(notifyTokenVar, eventToken, resType, resName, stackName)",
+     "TestProcessInjectsPrefixedWiring", 1),
+
+    # Same mutation, different test: this one proves the secret FLAG
+    # survives marshalling into ComputeProcessResponse. The engine-side
+    # collector and the plugin-side one are different implementations, so
+    # a test against the former says nothing about the live bus.
+    ("plugin", "secret flag lost crossing the plugin bus", PLG_COMPUTE, PLUGIN_PKG,
+     "\tcollector.AddSecretEnvVariableIfNotExist(notifyTokenVar, eventToken, resType, resName, stackName)",
+     "\tcollector.AddEnvVariableIfNotExist(notifyTokenVar, eventToken, resType, resName, stackName)",
+     "TestWiringSurvivesThePluginBus", 1),
+
+    # Without the extension, `${resource:my-notifier.token}` resolves to
+    # nothing — and ResolvePlaceholders fails OPEN, so the literal string
+    # deploys cleanly and surfaces as a 401 at the first incident.
+    ("plugin", "template extension never published", PLG_COMPUTE, PLUGIN_PKG,
+     "\tcollector.AddResourceTplExtension(resName, map[string]string{\n"
+     "\t\ttplKeyURL:   serviceURL,\n\t\ttplKeyToken: eventToken,\n\t})",
+     "\t_ = collector",
+     "TestProcessPublishesResolvablePlaceholders", 1),
+
+    ("plugin", "placeholder published under the wrong key", PLG_COMPUTE, PLUGIN_PKG,
+     "\t\ttplKeyURL:   serviceURL,", '\t\t"self-url":   serviceURL,',
+     "TestProcessPublishesResolvablePlaceholders", 1),
+
+    # The whole point of a per-consumer token: the ingest handler takes an
+    # event's `source` from the `tenant` claim, so one claim shared across
+    # publishers means every alert is attributed to whichever consumer the
+    # claim names, and a channel's `sources:` allowlist stops meaning what
+    # it says. Invisible to a single-publisher smoke.
+    ("plugin", "every consumer's token carries the same tenant", PLG_COMPUTE, PLUGIN_PKG,
+     "\teventToken, err := mintEventJWT(signingKey, stackName)",
+     "\teventToken, err := mintEventJWT(signingKey, resName)",
+     "TestTokensAreScopedPerConsumer", 1),
+
+    # Restores the pre-2026-11-23 behaviour. It is a cold-start deadlock
+    # once a sibling COMPONENT can be a consumer: on a first provision the
+    # notifier's Lambda does not exist yet, so every publisher in the stack
+    # fails — including on the provision that creates the notifier.
+    ("plugin", "registration failure fails the deploy again", PLG_COMPUTE, PLUGIN_PKG,
+     "\tif err := p.pushRegister(ctx.Context(), serviceURL, registerToken, record); err != nil {\n"
+     "\t\tif p.cfg.Progress != nil {\n"
+     "\t\t\tp.cfg.Progress.Error(\"compute-process\", fmt.Sprintf(\n"
+     "\t\t\t\t\"tenant %q not pre-registered at %s after %d attempts: %v — wiring injected anyway; "
+     "the tenant row is created on its first event\",\n"
+     "\t\t\t\tstackName, serviceURL, maxAttempts, err,\n"
+     "\t\t\t))\n\t\t}\n\t} else if p.cfg.Progress != nil {\n"
+     "\t\tp.cfg.Progress.Info(\"compute-process\", fmt.Sprintf(\"registered tenant %q at %s\", stackName, serviceURL))\n\t}",
+     "\tif err := p.pushRegister(ctx.Context(), serviceURL, registerToken, record); err != nil {\n"
+     "\t\treturn nil, err\n\t}",
+     "TestRegistrationFailureStillInjectsWiring", 1),
+
+    # The other side of that line, and the one that must NOT soften:
+    # unresolvable wiring hard-fails. No URL means the publisher can never
+    # alert anyone, and a notifier that silently does not notify is the
+    # worst outcome available.
+    ("plugin", "unresolvable service URL warns instead of failing", PLG_COMPUTE, PLUGIN_PKG,
+     "\tserviceURL, err := p.readServiceURL(input, params)\n\tif err != nil {\n"
+     '\t\treturn nil, errors.Wrapf(err, "component %q unable to resolve service URL", resName)\n\t}',
+     "\tserviceURL, _ := p.readServiceURL(input, params)",
+     "TestUnresolvableWiringStillFailsTheDeploy", 1),
 ]
 
 TEST_FILE_PREFIXES = (
@@ -693,6 +824,7 @@ TEST_FILE_PREFIXES = (
     "telegram_test.go:", "webhook_test.go:", "seal_test.go:", "store_blob_test.go:",
     "registry_test.go:", "events_ingest_test.go:", "scheduler_tick_test.go:",
     "config_test.go:", "channels_cfg_test.go:", "tenant_env_test.go:", "compute_test.go:",
+    "compute_wiring_test.go:",
 )
 COMPILE_MARKERS = ("build failed", "undefined:", "declared and not used", "cannot use")
 
@@ -735,6 +867,14 @@ def main() -> int:
         for group, name, _, _, _, _, test, _ in muts:
             print(f"{group:9} {name:48} {test}")
         return 0
+
+    # SIGTERM does not raise, so the restore in `finally` below never runs
+    # and the tree is left with exactly one file mutated — which then shows
+    # up as an unrelated failure in whatever runs next. Turning it into
+    # SystemExit makes the restore happen. Live-caught 2026-11-23: a
+    # two-minute wrapper timeout on the full run left
+    # plugin/internal/channels_cfg.go mutated, and only `git status` said so.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(130))
 
     backup = pathlib.Path(tempfile.mkdtemp(prefix="mutation-check-"))
     for mod in MODULES:

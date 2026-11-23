@@ -369,18 +369,26 @@ func TestEventsIngest_FirstEventRegistersTheTenant(t *testing.T) {
 func TestEventsIngest_SubsequentEventRefreshesLastSeen(t *testing.T) {
 	RegisterTestingT(t)
 	f := newIngestFixture(t, nil, oneChannel())
+	// A controlled clock, because real time makes this assertion vacuous:
+	// two posts land in the same millisecond, so `LastSeenAt >= first`
+	// holds whether the refresh happened or not, and a mutation that skips
+	// the refresh entirely passes.
+	clock := time.Date(2026, 11, 23, 9, 0, 0, 0, time.UTC)
+	f.rewireNow(func() time.Time { return clock })
 
 	Expect(f.post(t, "event", "my-backup", validEvent()).Code).To(Equal(http.StatusAccepted))
 	first, _ := f.tenant(t, "my-backup")
 
 	// A DIFFERENT id: the same one would short-circuit at the dedupe gate,
 	// which sits before the bookkeeping on purpose.
+	clock = clock.Add(90 * time.Minute)
 	second := validEvent()
 	second["id"] = "backup.failed:forge-conductor:run-8"
 	Expect(f.post(t, "event", "my-backup", second).Code).To(Equal(http.StatusAccepted))
 
 	rec, _ := f.tenant(t, "my-backup")
-	Expect(rec.LastSeenAt).To(BeTemporally(">=", first.LastSeenAt))
+	Expect(rec.LastSeenAt).To(BeTemporally("==", clock),
+		"last seen was not refreshed, so a publisher that has gone quiet reads as healthy")
 	Expect(rec.CreatedAt).To(BeTemporally("==", first.CreatedAt),
 		"a refresh must not restamp CreatedAt — that is the only record of when the publisher first appeared")
 }
@@ -433,6 +441,14 @@ func (f *ingestFixture) rewireTenants(tenants tenant.Store) {
 	f.mux = http.NewServeMux()
 	f.mux.Handle("POST /api/v1/events",
 		JWTMiddleware([]byte(testKey))(EventsIngest(f.store, events.NewRouter(f.store, -1), f.routes, tenants, nil)))
+}
+
+// rewireNow rebuilds the handler on a controlled clock, keeping the
+// fixture's own stores.
+func (f *ingestFixture) rewireNow(now func() time.Time) {
+	f.mux = http.NewServeMux()
+	f.mux.Handle("POST /api/v1/events",
+		JWTMiddleware([]byte(testKey))(EventsIngest(f.store, events.NewRouter(f.store, -1), f.routes, f.tenants, now)))
 }
 
 // The trade stated plainly: losing the alert to fix the bookkeeping is

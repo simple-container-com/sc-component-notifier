@@ -79,11 +79,13 @@ jobs:
           go-version: '1.26'
           cache-dependency-path: service/go.sum
 
-      # Warm the build cache once, so 31 sequential `go test -run` calls
-      # don't each pay for a cold compile.
+      # Warm the build cache once per module, so the one `go test -run`
+      # call per mutation (111 of them today) doesn't each pay for a cold
+      # compile. Both modules: the harness mutates service/ and plugin/.
       - name: prime build cache
-        working-directory: service
-        run: go test ./... -count=1 -run XXXNONE
+        run: |
+          (cd service && go test ./... -count=1 -run XXXNONE)
+          (cd plugin  && go test ./... -count=1 -run XXXNONE)
 
       - name: mutation check
         run: python3 hack/mutation-check.py
