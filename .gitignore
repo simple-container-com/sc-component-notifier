@@ -9,7 +9,12 @@
 # .sc/secrets.yaml registries are committed).
 /.sc/state/
 /.sc/stacks/*/secrets.yaml
+/.sc/cfg.*.yaml
 /.sc/cfg.github.yaml
+
+# Plaintext credentials SC manages: stored encrypted in .sc/secrets.yaml,
+# written here only between `sc secrets reveal` and `sc secrets hide`.
+/.sc/deploy-keys/
 
 # Go
 /plugin/vendor/
