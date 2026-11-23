@@ -38,30 +38,85 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The `service` module replaces github.com/FerretDB/FerretDB with the
+      # PRIVATE fork github.com/simple-container-com/go-embedb, so even
+      # `go build` needs a read credential — the replace is resolved while
+      # loading the module graph, long before any build tag or env var is
+      # consulted. Decrypted from this repo's SC registry with the single
+      # org-level SC_CONFIG. A PR from a fork gets no secret and fails
+      # loudly on the `test -s` guard below. api/ and plugin/ don't have
+      # the private dep, so the step is conditional.
+      - uses: simple-container-com/actions/install-sc@main
+        if: matrix.module == 'service'
+      - name: Reveal the go-embedb deploy key
+        if: matrix.module == 'service'
+        working-directory: .
+        env:
+          SIMPLE_CONTAINER_CONFIG: ${{ secrets.SC_CONFIG }}
+        run: |
+          set -euo pipefail
+          sc secrets reveal --force
+          test -s .sc/deploy-keys/go-embedb.pem
+          # `sc secrets reveal` writes 0644. ssh refuses a world-readable
+          # private key outright ("bad permissions") and then reports the
+          # fetch as `Permission denied (publickey)`, which reads like the
+          # wrong key rather than the wrong mode.
+          chmod 600 .sc/deploy-keys/go-embedb.pem
+
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26'
+          go-version-file: ${{ matrix.module }}/go.mod
           cache-dependency-path: ${{ matrix.module }}/go.sum
 
       - name: go build
-        run: go build ./...
+        env:
+          # Keeps the private module off the public proxy (which cannot
+          # read it and reports git's auth failure as a misleading
+          # `invalid version`) and off the checksum database.
+          GOPRIVATE: github.com/simple-container-com/*
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.module }}" = "service" ]; then
+            git config --global url."git@github.com:".insteadOf "https://github.com/"
+            export GIT_SSH_COMMAND="ssh -i ${GITHUB_WORKSPACE}/.sc/deploy-keys/go-embedb.pem -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          fi
+          go build ./...
 
       # `go vet` compiles test packages, which `go build ./...` does not.
       # That difference is not academic: adding a method to an interface
       # leaves every fake in a _test.go file unimplementing it, and a
       # build-only gate ships that happily.
       - name: go vet
-        run: go vet ./...
+        env:
+          GOPRIVATE: github.com/simple-container-com/*
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.module }}" = "service" ]; then
+            export GIT_SSH_COMMAND="ssh -i ${GITHUB_WORKSPACE}/.sc/deploy-keys/go-embedb.pem -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          fi
+          go vet ./...
 
       - name: go test
-        run: go test ./... -count=1
+        env:
+          GOPRIVATE: github.com/simple-container-com/*
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.module }}" = "service" ]; then
+            export GIT_SSH_COMMAND="ssh -i ${GITHUB_WORKSPACE}/.sc/deploy-keys/go-embedb.pem -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          fi
+          go test ./... -count=1
 
       # -race only on the service module: it is the one with concurrency
       # (the delivery drain's single-flight lease), and it is the one
       # where a data race would mean duplicate notifications.
       - name: go test -race
         if: matrix.module == 'service'
-        run: go test ./... -count=1 -race
+        env:
+          GOPRIVATE: github.com/simple-container-com/*
+        run: |
+          set -euo pipefail
+          export GIT_SSH_COMMAND="ssh -i ${GITHUB_WORKSPACE}/.sc/deploy-keys/go-embedb.pem -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          go test ./... -count=1 -race
 
   # Asserts the tests actually catch the faults they claim to. See
   # hack/mutation-check.py — it breaks one guard at a time and requires
@@ -74,9 +129,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # service's private go-embedb dep needs the reveal to resolve.
+      # Same credential path as the `service` matrix cell above.
+      - uses: simple-container-com/actions/install-sc@main
+      - name: Reveal the go-embedb deploy key
+        env:
+          SIMPLE_CONTAINER_CONFIG: ${{ secrets.SC_CONFIG }}
+        run: |
+          set -euo pipefail
+          sc secrets reveal --force
+          test -s .sc/deploy-keys/go-embedb.pem
+          chmod 600 .sc/deploy-keys/go-embedb.pem
+
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26'
+          go-version-file: service/go.mod
           cache-dependency-path: service/go.sum
 
       # Warm the build cache once per module, so the one `go test -run`
@@ -90,11 +157,19 @@ jobs:
       # answered INTERNAL_ERROR mid-zip for antonmedv/expr).
       - name: prime build cache
         continue-on-error: true
+        env:
+          GOPRIVATE: github.com/simple-container-com/*
+          GIT_SSH_COMMAND: ssh -i ${{ github.workspace }}/.sc/deploy-keys/go-embedb.pem -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
         run: |
+          set -euo pipefail
+          git config --global url."git@github.com:".insteadOf "https://github.com/"
           (cd service && go test ./... -count=1 -run XXXNONE)
           (cd plugin  && go test ./... -count=1 -run XXXNONE)
 
       - name: mutation check
+        env:
+          GOPRIVATE: github.com/simple-container-com/*
+          GIT_SSH_COMMAND: ssh -i ${{ github.workspace }}/.sc/deploy-keys/go-embedb.pem -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
         run: python3 hack/mutation-check.py
 
       # A mutation that is written back incorrectly would leave the tree
