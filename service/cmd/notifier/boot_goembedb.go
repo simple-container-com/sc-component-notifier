@@ -81,10 +81,29 @@ func bootGoEmbedOnce(logger *slog.Logger) (*goEmbed, error) {
 		ReplSetName: replSet,
 	}
 
-	// Replication substrate. OPTIONAL — notifier has one writer today,
-	// so a single-node embed (no GOEMBEDB_S3_BUCKET) is a valid "just
-	// put it in sqlite" deploy. S3 replication fires only when the
-	// bucket is configured.
+	// Replication substrate. OPTIONAL on long-lived hosts (ECS / VM /
+	// local smoke) — a single-node embed is a valid "just put it in
+	// sqlite" deploy because the one writer keeps state across requests.
+	//
+	// HARD-REQUIRED on Lambda. Lambda's `/tmp` is per-container and dies
+	// with every container recycle, so "no bucket" means every warm
+	// container runs its own ephemeral store. That silently defeats
+	// three things notifier depends on:
+	//
+	//   1. `AcquireTickLease` single-flight — every warm container wins
+	//      its own lease; the delivery drain stops being exclusive and
+	//      **double-delivers to real recipients**. The adapter-level
+	//      race test in `storage.goembedb_test.go` catches a non-atomic
+	//      implementation of PutIfAbsent, but it cannot see storage
+	//      amnesia between containers — the exclusivity breaks BELOW
+	//      the test.
+	//   2. Idempotency keys (`events/*`) — per-container store means
+	//      replay dedupe silently stops deduping.
+	//   3. Cooldown records (`cooldown/*`) — reset on every cold start.
+	//
+	// So on Lambda, refuse to boot rather than warn. Operator either
+	// sets GOEMBEDB_S3_BUCKET (step 2 of the cutover) or leaves
+	// USE_GOEMBEDB=0; there is no silent middle ground.
 	if bucket := os.Getenv("GOEMBEDB_S3_BUCKET"); bucket != "" {
 		region := envOrDefault("GOEMBEDB_S3_REGION", os.Getenv("AWS_REGION"))
 		rep := &ferretdb.ReplicationStorageConfig{
@@ -121,6 +140,8 @@ func bootGoEmbedOnce(logger *slog.Logger) (*goEmbed, error) {
 		logger.Info("goembedb replication configured",
 			"bucket", rep.S3Bucket, "prefix", rep.S3Prefix, "region", rep.S3Region,
 			"ackWaitLiveOnly", rep.AckWaitLiveOnly, "heartbeatTTL", rep.HeartbeatTTL)
+	} else if isLambda() {
+		return nil, fmt.Errorf("goembedb: GOEMBEDB_S3_BUCKET is required on Lambda — `/tmp` is per-container and ephemeral, which defeats the single-flight tick lease and idempotency expiry. Set GOEMBEDB_S3_BUCKET (step 2 of the cutover) or leave USE_GOEMBEDB=0")
 	} else {
 		logger.Warn("GOEMBEDB_S3_BUCKET unset — running single-node, no replication")
 	}

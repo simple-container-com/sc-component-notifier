@@ -161,6 +161,16 @@ workaround in this PR.
   non-fatal and surface in the response body; the migration is
   idempotent (ReplaceOne-with-upsert), so a partial run can be
   retried.
+- **Set the replication bucket BEFORE the flag flip on Lambda.**
+  `GOEMBEDB_S3_BUCKET` is a separate env var; on Lambda it is
+  **hard-required** when `USE_GOEMBEDB=1`. Boot refuses with
+  `GOEMBEDB_S3_BUCKET is required on Lambda …` otherwise. The reason
+  is not optimisation: Lambda's `/tmp` is per-container and dies with
+  every container recycle, so without a shared bucket each warm
+  container runs its own ephemeral store. That silently defeats
+  `AcquireTickLease` single-flight (every container wins its own
+  lease → **double delivery to real recipients**), replay dedupe,
+  and cooldown tracking.
 - **Flip the flag.** Set `USE_GOEMBEDB=1` on the service and redeploy.
   `notifier_store_backend{backend="goembedb"}` on `/metrics` goes to
   `1`, `backend="s3"` to `0`.
