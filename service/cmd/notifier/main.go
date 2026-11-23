@@ -10,7 +10,11 @@
 //	SERVICE_JWT_SECRET               HS256 key, >= 32 bytes. Operator-set via
 //	                                 the plugin's config.signingKey. Also the
 //	                                 KEK for sealing SPA-written credentials.
-//	NOTIFIER_OPERATOR_PASSWORD       SPA login secret (optional)
+//	NOTIFIER_OPERATOR_PASSWORD       shared SPA login secret. Optional: unset
+//	                                 means POST /api/v1/login answers 403 and
+//	                                 the dashboard reads nothing. The boot log
+//	                                 says which, because an unset password is
+//	                                 otherwise indistinguishable from a typo.
 //	NOTIFIER_CHANNELS                JSON array of managed channel configs
 //	NOTIFIER_SELF_URL                this service's own public URL, for logs
 //	NOTIFIER_COOLDOWN                per-(source,subject,kind) quiet period
@@ -104,6 +108,21 @@ func main() {
 		os.Exit(2)
 	}
 
+	// The SPA's only credential. Optional by design — a deployment with
+	// no password set is read-nothing rather than read-everything — but
+	// "optional" used to mean "resolved and then read by nothing": the
+	// first deploy shipped a dashboard that asked the operator to paste a
+	// hand-minted JWT into localStorage, which is both unusable and the
+	// wrong secret to hand a browser (SERVICE_JWT_SECRET is also the KEK
+	// sealing every tenant's channel credentials). GET /api/v1/session
+	// reports whether this is set, so the SPA can tell a typo apart from
+	// a deployment that never configured a password.
+	operatorPassword, err := resolveAWSSecretARN(ctx, "NOTIFIER_OPERATOR_PASSWORD", os.Getenv("NOTIFIER_OPERATOR_PASSWORD"))
+	if err != nil {
+		slog.Error("could not resolve NOTIFIER_OPERATOR_PASSWORD", "err", err)
+		os.Exit(2)
+	}
+
 	sealer, err := crypto.NewSealer([]byte(jwtSecret))
 	if err != nil {
 		slog.Error("credential sealer unavailable", "err", err)
@@ -158,7 +177,11 @@ func main() {
 		"version", version, "commit", commit, "revision", revision,
 		"port", envOr("PORT", "8080"), "storage", target,
 		"managed_channels", len(managed), "cooldown", cooldown.String(),
-		"self_url", os.Getenv("NOTIFIER_SELF_URL"))
+		"self_url", os.Getenv("NOTIFIER_SELF_URL"),
+		// Not the value — just whether the dashboard can be logged into
+		// at all. An operator staring at a 403 should find the answer
+		// here rather than by guessing at the secret registry.
+		"operator_login", operatorPassword != "")
 
 	// Report the channels at boot, usable or not. An operator reading
 	// the cold-start log should be able to see that a channel exists and
@@ -187,6 +210,23 @@ func main() {
 	mux.Use(requestLogger)
 
 	mux.Get("/healthz", api.Healthz)
+
+	// Unauthenticated on purpose: the SPA has to be able to ask what kind
+	// of login it is facing before it holds a credential, and a login
+	// endpoint that required a session would be a closed loop. Login
+	// itself is rate-limited only by the shared password's entropy and a
+	// constant-time compare — no accounts, no lockout, same as the other
+	// two Components (D5).
+	session := &api.SessionConfig{
+		SigningKey:       []byte(jwtSecret),
+		OperatorPassword: operatorPassword,
+		// Secure cookies except in local HTTP development. Lambda is
+		// always behind TLS, so this is on in every deployed shape.
+		CookieSecure: os.Getenv("LOCAL_DEBUG") != "true",
+	}
+	mux.Get("/api/v1/session", session.Session)
+	mux.Post("/api/v1/login", session.Login)
+	mux.Post("/api/v1/logout", session.Logout)
 
 	mux.Group(func(r chi.Router) {
 		r.Use(api.JWTMiddleware([]byte(jwtSecret)))

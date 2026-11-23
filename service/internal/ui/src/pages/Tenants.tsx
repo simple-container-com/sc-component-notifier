@@ -1,49 +1,21 @@
 import { useQuery } from '@tanstack/react-query'
-import axios from 'axios'
-
-interface TenantRecord {
-  stackName: string
-  version: string
-  resources?: Array<{ type: string; name: string }>
-  createdAt: string
-  lastSeenAt: string
-  softDeleted?: boolean
-}
-
-interface TenantsResponse {
-  tenants: TenantRecord[]
-  count: number
-}
-
-async function fetchTenants(): Promise<TenantsResponse> {
-  // The SPA is served from the same origin as the API. The JWT in
-  // localStorage.notifierToken is produced by an operator tool; for the
-  // smoke, we just show what the backend has.
-  const token = localStorage.getItem('notifierToken') ?? ''
-  const { data } = await axios.get<TenantsResponse>('/api/v1/tenants', {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  })
-  return data
-}
+import { api, describeError } from '../api/client'
 
 export function Tenants() {
+  // Authenticated by the operator session cookie — App only renders this
+  // once the session probe says so. There is no token handling here on
+  // purpose: the first deploy asked the operator to paste a hand-minted
+  // JWT into `localStorage.notifierToken`, which was both unusable and
+  // the wrong secret to put in a browser.
   const { data, isLoading, error } = useQuery({
     queryKey: ['tenants'],
-    queryFn: fetchTenants,
+    queryFn: api.tenants,
     refetchInterval: 5000,
   })
 
   if (isLoading) return <p>Loading…</p>
   if (error) {
-    return (
-      <div>
-        <p style={{ color: '#c00' }}>Error fetching tenants: {(error as Error).message}</p>
-        <p>
-          Hint: set <code>localStorage.notifierToken</code> to a valid JWT (op=register, signed with the
-          deployed <code>SERVICE_JWT_SECRET</code>).
-        </p>
-      </div>
-    )
+    return <p style={{ color: '#c00' }}>Error fetching tenants: {describeError(error)}</p>
   }
 
   const tenants = data?.tenants ?? []

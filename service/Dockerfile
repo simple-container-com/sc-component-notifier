@@ -43,8 +43,11 @@ ARG RUNTIME_BASE=public.ecr.aws/amazonlinux/amazonlinux:2023
 FROM node:${NODE_VERSION} AS ui-builder
 
 WORKDIR /ui
-COPY internal/ui/package.json ./
-# COPY internal/ui/package-lock.json ./   ← uncomment once a lockfile exists
+COPY internal/ui/package.json internal/ui/package-lock.json ./
+# `npm install` rather than `npm ci` on purpose: with the lockfile present
+# it installs from it, but it does not hard-fail when package.json and the
+# lock drift. A drift is worth fixing, not worth failing a deploy eight
+# minutes in from a cold build.
 RUN npm install --no-audit --no-fund
 COPY internal/ui/ ./
 RUN npm run build:prod

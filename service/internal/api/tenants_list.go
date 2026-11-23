@@ -14,12 +14,18 @@ import (
 // TenantsList returns the handler for GET /api/v1/tenants.
 //
 // Consumed by the embedded SPA. Returns all currently-registered tenants,
-// including soft-deleted ones for operator visibility. JWT-authed via the
-// middleware; the handler does NOT further restrict by claims (a signed
-// token is enough for the notifier — real components may gate by operator
-// role).
+// including soft-deleted ones for operator visibility.
+//
+// Gated on `op: "operator"`, not merely on a valid signature. The
+// original comment here said "a signed token is enough for the notifier
+// — real components may gate by operator role", which was wrong in a way
+// that mattered: every publisher stack holds a valid `event` token, so
+// any one tenant could enumerate all of them. See requireOperator.
 func TenantsList(store tenant.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireOperator(w, r) {
+			return
+		}
 		rows, err := store.List(r.Context())
 		if err != nil {
 			slog.Error("tenants list failed", "err", err)

@@ -18,6 +18,16 @@
 
 # Node
 /service/internal/ui/node_modules/
+/service/internal/ui/tsconfig.tsbuildinfo
+
+# A LOCAL `npm run build:prod` writes a real bundle here. It must not be
+# committed while the Dockerfile still has a Node stage: the deployed UI
+# comes from that stage, so a committed bundle would be a second source
+# of truth that nothing rebuilds and nobody serves. Only the placeholder
+# dist/index.html is tracked (see the long note above). Building locally
+# is still the way to typecheck the SPA before pushing — the Docker build
+# is where a TS error would otherwise surface, eight minutes in.
+/service/internal/ui/dist/assets/
 
 # NOTE: internal/ui/dist/ is deliberately NOT ignored. The Go binary
 # embeds it with go:embed, and an embed of a missing directory is a

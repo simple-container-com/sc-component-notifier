@@ -102,6 +102,9 @@ REG = "service/internal/registry/registry.go"
 TENANT = "service/internal/tenant/store_blob.go"
 INGEST = "service/internal/api/events_ingest.go"
 TICK = "service/internal/api/scheduler_tick.go"
+SESSION = "service/internal/api/session.go"
+JWTMW = "service/internal/api/jwt_middleware.go"
+TENANTS_LIST = "service/internal/api/tenants_list.go"
 
 PLG_CONFIG = "plugin/internal/config.go"
 PLG_CHANNELS = "plugin/internal/channels_cfg.go"
@@ -477,6 +480,80 @@ MUTATIONS = [
      "\t\tres, err := drainer.Drain(r.Context())\n\t\tif err != nil {",
      "\t\tres, err := drainer.Drain(r.Context())\n\t\tif err != nil && false {",
      "TestDeliveryTick_DrainErrorIs500", 1),
+
+    # --------------------------------------------------------------- session
+    # The operator login flow and the op-gating it makes possible. Both
+    # halves were MISSING from the first deploy (2026-11-23): the SPA asked
+    # the operator to paste a hand-minted JWT into
+    # `localStorage.notifierToken`, while NOTIFIER_OPERATOR_PASSWORD was
+    # resolved at boot and then read by nothing.
+    #
+    # The first entry is the one that matters. GET /api/v1/tenants shipped
+    # with no op check and a comment saying "a signed token is enough for
+    # the notifier" — but EVERY publisher stack's plugin holds a valid
+    # `event` token for this service, and those are scoped to one tenant
+    # precisely so a publisher cannot reach past itself. An ungated read
+    # route handed that back.
+    ("session", "any valid token may enumerate tenants", TENANTS_LIST, API_PKG,
+     "\t\tif !requireOperator(w, r) {\n\t\t\treturn\n\t\t}\n", "",
+     "TestTenantsList_OnlyAnOperatorTokenMayEnumerateTenants", 1),
+
+    ("session", "requireOperator checks validity, not purpose", JWTMW, API_PKG,
+     "if claims == nil || claims.Op != OpOperator {", "if claims == nil {",
+     "TestTenantsList_OnlyAnOperatorTokenMayEnumerateTenants", 1),
+
+    ("session", "session probe checks validity, not purpose", SESSION, API_PKG,
+     "return err == nil && tok.Valid && claims.Op == OpOperator",
+     "return err == nil && tok.Valid",
+     "TestSession_AnEventTokenIsNotAnOperatorSession", 1),
+
+    # An unset password is a misconfigured deploy; a wrong one is a typo.
+    # Answering both the same way sends an operator hunting for a typo
+    # that cannot exist, because `operatorPassword` is optional.
+    ("session", "unset password answers like a wrong one", SESSION, API_PKG,
+     'writeErr(w, http.StatusForbidden, "NOTIFIER_OPERATOR_PASSWORD not set on the server")',
+     'writeErr(w, http.StatusUnauthorized, "wrong password")',
+     "TestLogin_NoPasswordConfiguredIs403NotJust401", 1),
+
+    # Compares body.Password against ITSELF rather than deleting the
+    # comparison: dropping it entirely leaves `subtle` unused and the
+    # mutation reports INVALID instead of proving anything. Live-caught
+    # while writing this entry.
+    ("session", "password never actually compared", SESSION, API_PKG,
+     "[]byte(c.OperatorPassword)) != 1", "[]byte(body.Password)) != 1",
+     "TestLogin_WrongPasswordIs401AndSetsNoCookie", 1),
+
+    # HttpOnly is the whole reason the token left localStorage: this one
+    # is signed with the key that also seals every tenant's channel
+    # credentials, so a page script must not be able to read it.
+    ("session", "session cookie readable from JavaScript", SESSION, API_PKG,
+     "\t\tHttpOnly: true,\n\t\tSecure:   c.CookieSecure,\n\t\tSameSite: http.SameSiteLaxMode,\n\t\tExpires",
+     "\t\tHttpOnly: false,\n\t\tSecure:   c.CookieSecure,\n\t\tSameSite: http.SameSiteLaxMode,\n\t\tExpires",
+     "TestLogin_RightPasswordSetsAnHTTPOnlySessionCookie", 1),
+
+    ("session", "logout leaves the cookie alive", SESSION, API_PKG,
+     "\t\tMaxAge:   -1,", "\t\tMaxAge:   3600,",
+     "TestLogout_ClearsTheCookieAndIsIdempotent", 1),
+
+    # Without the cookie transport the SPA cannot authenticate at all — a
+    # browser cannot set an Authorization header on a page load. This is
+    # why the first deploy reached for localStorage.
+    ("session", "cookie transport removed", JWTMW, API_PKG,
+     '\tif c, err := r.Cookie(SessionCookieName); err == nil && c.Value != "" {\n\t\treturn c.Value\n\t}\n',
+     "",
+     "TestJWTMiddleware_AcceptsTheSessionCookieAndPrefersTheHeader", 1),
+
+    # Precedence matters the other way too: a curl with an explicit Bearer
+    # token must not be silently overridden by whatever session cookie the
+    # browser happens to hold.
+    ("session", "cookie takes precedence over the Bearer header", JWTMW, API_PKG,
+     '\tif authz := r.Header.Get("Authorization"); strings.HasPrefix(authz, "Bearer ") {\n'
+     '\t\treturn strings.TrimPrefix(authz, "Bearer ")\n\t}\n'
+     '\tif c, err := r.Cookie(SessionCookieName); err == nil && c.Value != "" {\n\t\treturn c.Value\n\t}\n',
+     '\tif c, err := r.Cookie(SessionCookieName); err == nil && c.Value != "" {\n\t\treturn c.Value\n\t}\n'
+     '\tif authz := r.Header.Get("Authorization"); strings.HasPrefix(authz, "Bearer ") {\n'
+     '\t\treturn strings.TrimPrefix(authz, "Bearer ")\n\t}\n',
+     "TestJWTMiddleware_AcceptsTheSessionCookieAndPrefersTheHeader", 1),
 
     # ---------------------------------------------------------------- plugin
     # The dead branch, restored as a mutation. Before 2026-11-23
