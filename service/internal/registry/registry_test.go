@@ -6,10 +6,14 @@ package registry
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
+
+	"go.mongodb.org/mongo-driver/mongo"
 
 	"github.com/simple-container-com/sc-component-notifier/service/internal/channel"
 	"github.com/simple-container-com/sc-component-notifier/service/internal/crypto"
@@ -25,11 +29,16 @@ const botToken = "123456:UNMISTAKABLE-BOT-TOKEN"
 
 type capturingLog struct {
 	infos  []string
+	warns  []string
 	errors []string
 }
 
 func (l *capturingLog) Infof(format string, args ...any) {
 	l.infos = append(l.infos, fmt.Sprintf(format, args...))
+}
+
+func (l *capturingLog) Warnf(format string, args ...any) {
+	l.warns = append(l.warns, fmt.Sprintf(format, args...))
 }
 
 func (l *capturingLog) Errorf(format string, args ...any) {
@@ -540,4 +549,89 @@ func TestChannelsReReadsOnEveryCall(t *testing.T) {
 	if _, ok := chans["added-later"]; !ok {
 		t.Fatal("a channel added after construction is not in the live set — the map is cached")
 	}
+}
+
+// notWritableStore is an InMemoryStore whose Put always fails the way
+// go-embedb's lease gate fails it on a replica that does not hold the
+// tenant's write lease. Everything else (Get/List/Delete) still works,
+// because on go-embedb it still does: reads are served by any replica
+// and `delete` is last-write-wins.
+type notWritableStore struct {
+	*storage.InMemoryStore
+}
+
+// errLeaseRefused mirrors the wire shape, with the literal 10107 rather
+// than a reference to mongox's constant — see the comment on
+// mongox.errNotWritablePrimary for why building the fixture from the
+// package's own const makes a test self-consistent and useless.
+func (notWritableStore) Put(context.Context, string, io.Reader) (int64, error) {
+	return 0, fmt.Errorf("storage.MongoStore.Put: %w", mongo.CommandError{
+		Code:    10107,
+		Name:    "NotWritablePrimary",
+		Message: "not master - please connect to primary slot 127.0.0.1:0",
+	})
+}
+
+// TestSeed_NonLeaseOwnerWarnsAndBoots is the regression test for the
+// 2026-11-24 16:21Z notifier crash loop: Seed's PutChannel was fatal, so
+// every Lambda execution environment that did not hold the go-embedb
+// write lease died in init and Lambda answered the 502 by spawning
+// another one. Five boots died in the first minute after deploy.
+func TestSeed_NonLeaseOwnerWarnsAndBoots(t *testing.T) {
+	t.Parallel()
+
+	log := &capturingLog{}
+	store := events.NewBlobStore(notWritableStore{storage.NewInMemoryStore()}, "")
+	reg := New(Config{
+		Store:   store,
+		Sealer:  testSealer(t),
+		Managed: []Managed{telegramManaged("ops-telegram")},
+		Log:     log,
+		Now:     func() time.Time { return time.Date(2026, 11, 24, 16, 21, 0, 0, time.UTC) },
+	})
+
+	if err := reg.Seed(context.Background()); err != nil {
+		t.Fatalf("Seed returned %v; a replica that does not hold the write lease must still boot", err)
+	}
+	if !log.contains(log.warns, "does not hold the") {
+		t.Fatalf("expected a warning naming the lease as the reason; warns=%v errors=%v",
+			log.warns, log.errors)
+	}
+	if len(log.errors) != 0 {
+		t.Fatalf("expected no ERROR for a normal non-owner boot, got %v", log.errors)
+	}
+}
+
+// TestSeed_OtherPutErrorsStayFatal is the other half: the guard must be
+// narrow. A store that is genuinely broken has to fail the boot, or the
+// operator's declared alerting path is silently absent — the one failure
+// this component exists to prevent.
+func TestSeed_OtherPutErrorsStayFatal(t *testing.T) {
+	t.Parallel()
+
+	log := &capturingLog{}
+	store := events.NewBlobStore(brokenStore{storage.NewInMemoryStore()}, "")
+	reg := New(Config{
+		Store:   store,
+		Sealer:  testSealer(t),
+		Managed: []Managed{telegramManaged("ops-telegram")},
+		Log:     log,
+		Now:     func() time.Time { return time.Date(2026, 11, 24, 16, 21, 0, 0, time.UTC) },
+	})
+
+	err := reg.Seed(context.Background())
+	if err == nil {
+		t.Fatal("Seed returned nil; a store failure that is NOT a lease refusal must stay fatal")
+	}
+	if !strings.Contains(err.Error(), "ops-telegram") {
+		t.Fatalf("error should name the channel, got %v", err)
+	}
+}
+
+type brokenStore struct {
+	*storage.InMemoryStore
+}
+
+func (brokenStore) Put(context.Context, string, io.Reader) (int64, error) {
+	return 0, errors.New("no reachable servers")
 }

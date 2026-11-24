@@ -588,6 +588,7 @@ func serveMode() string {
 type slogLogger struct{}
 
 func (slogLogger) Infof(format string, args ...any)  { slog.Info(fmt.Sprintf(format, args...)) }
+func (slogLogger) Warnf(format string, args ...any)  { slog.Warn(fmt.Sprintf(format, args...)) }
 func (slogLogger) Errorf(format string, args ...any) { slog.Error(fmt.Sprintf(format, args...)) }
 
 // requestLogger is a minimal structured-log middleware. Not

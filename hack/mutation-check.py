@@ -987,6 +987,28 @@ MUTATIONS = [
      "const codeNotWritablePrimary = 10107",
      "const codeNotWritablePrimary = 10108",
      "TestCodeMatchesWireSpec|TestIsNotWritablePrimary", 1),
+
+    # ------------------------------------------- registry: the seed guard
+    # The second instance of the same fault, and the one that actually
+    # crash-looped this service: Seed's PutChannel is an upsert, which
+    # go-embedb classifies RMW, so every Lambda environment that did not
+    # hold the write lease died in init. Live-caught 2026-11-24 16:21Z,
+    # five dead boots in the first minute after deploy.
+    #
+    # Both directions again. The `&& false` / `|| err != nil` shapes are
+    # deliberate rather than deleting the call: dropping the mongox use
+    # entirely leaves an unused import, so the package fails to BUILD and
+    # the mutant would be reported as caught by a compile error rather
+    # than by the assertion that matters.
+    ("registry", "non-owner seed fatal again (the notifier's own outage)", REG, REG_PKG,
+     "\t\t\tif mongox.IsNotWritablePrimary(err) {",
+     "\t\t\tif mongox.IsNotWritablePrimary(err) && false {",
+     "TestSeed_NonLeaseOwnerWarnsAndBoots", 1),
+
+    ("registry", "every seed error swallowed, not just 10107", REG, REG_PKG,
+     "\t\t\tif mongox.IsNotWritablePrimary(err) {",
+     "\t\t\tif err != nil || mongox.IsNotWritablePrimary(err) {",
+     "TestSeed_OtherPutErrorsStayFatal", 1),
 ]
 
 TEST_FILE_PREFIXES = (
