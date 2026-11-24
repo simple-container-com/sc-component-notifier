@@ -66,6 +66,18 @@ type NotifierConfig struct {
 	// queue, so it is a write path and must not be open.
 	SchedulerToken string `json:"schedulerToken,omitempty" yaml:"schedulerToken,omitempty"`
 
+	// MigrationToken is a `${secret:...}` reference to the bearer that
+	// gates `POST /admin/migrate-s3-to-goembedb` (the `X-Admin-Token`
+	// header) during the S3 → go-embedb cutover.
+	//
+	// Optional, and **omitting it is the safe default**: the service
+	// registers the route only when the value is non-empty, so a
+	// notifier whose operator never opted in has no migration surface
+	// at all rather than an open one. Declare it for the cutover,
+	// delete the line afterwards — the route disappears on the next
+	// provision.
+	MigrationToken string `json:"migrationToken,omitempty" yaml:"migrationToken,omitempty"`
+
 	// Storage names ANOTHER SC RESOURCE to keep the notifier's own state
 	// in — channels, the event dedupe window and the delivery queue.
 	//

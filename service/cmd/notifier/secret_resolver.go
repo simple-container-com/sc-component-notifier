@@ -43,6 +43,13 @@ import (
 //     `env.BACKUP_OPERATOR_PASSWORD` at deploy time; the generic
 //     secret-env wire (PR #1817) replaced it with an ARN that the
 //     service was never taught to resolve.
+//   - ADMIN_MIGRATION_TOKEN: the `X-Admin-Token` compare on the
+//     S3 → go-embedb migration endpoint. Unresolved, every operator
+//     curl is a 401 against a route that is registered and reachable —
+//     and since the operator holds the plaintext from the secrets
+//     registry, the obvious conclusion is "I typed it wrong", not "the
+//     service is holding an ARN". Added with the `migrationToken:`
+//     secret-env binding rather than after a third incident.
 //   - The service's own session-cookie JWT is self-consistent (signs +
 //     validates with whatever the env holds) — breaking it is NOT the
 //     direct symptom, but every cross-process JWT from an operator / CI

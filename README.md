@@ -195,11 +195,44 @@ notifier_store_backend{backend="s3"} == 1 AND <expected-cutover-time>
 
 `ADMIN_MIGRATION_TOKEN` gates the migration endpoint. **Empty disables
 the endpoint entirely** — that is the safe default: an operator who
-did not opt in never opens an unauthenticated migration route. In this
-PR the value is read as a plain env; PR B binds it through the SC
-secret-env wire so an operator writes a one-line `migrationToken:` in
-`server.yaml` and the token arrives in the Lambda as a SecretsManager
-ARN.
+did not opt in never opens an unauthenticated migration route, and the
+service answers `404`, not `401`, so the route's existence is not
+advertised either.
+
+The operator never sets that env var directly. It is bound from one
+line of component config through the SC secret-env wire:
+
+```yaml
+my-notifier:
+  type: sc-notifier
+  config:
+    # … deployTo / image / signingKey / ingress …
+    migrationToken: "${secret:sc-notifier-migration-token}"
+```
+
+`sc secrets add` the value once, provision, and the token reaches the
+Lambda as a **SecretsManager ARN** (the fleet convention — a credential
+this wide must not sit in a function's environment at rest); the service
+resolves the ARN at startup via `secret_resolver.go`.
+
+**Delete the line again when the cutover is done.** The route is
+registered only while the value is non-empty, so removing it and
+re-provisioning is how the migration surface goes away — there is no
+second switch. That is also why `migrationToken` is the one credential
+in this component's config whose *absence* is the intended steady state.
+
+Two guards keep the wire honest, both of which exist because the
+failure mode is silent rather than loud:
+
+- `TestSecretEnvVarsAreResolvedByTheService` (plugin side) asserts every
+  env var in `ComponentSecretEnvMap` reaches `resolveAWSSecretARN` in the
+  service's `main`. A bound secret the service reads with a bare
+  `os.Getenv` gets the ARN string and compares against it forever —
+  live-caught twice in this fleet, listed in `secret_resolver.go`.
+- `TestSecretEnvKeysAreOperatorWritable` asserts every bound key is also
+  on the `ComponentAllowedOverrides` allowlist, since core dual-uses that
+  list as the allowed-top-level-keys check — a binding whose key is not
+  allowlisted is refused at parse time and can never fire.
 
 ## Running tests
 
@@ -222,6 +255,12 @@ no external services.
   service) needs an `api` core change and is not in a release yet — see
   `forge/docs/design/2026-11-23/component-uses-wiring/`. Until it lands,
   only a deploying service can be a consumer.
+- go-embedb adoption is **code-complete, not shipped**: the store, the
+  Lambda no-bucket boot guard and the `migrationToken:` secret wire are
+  on `main`, but `USE_GOEMBEDB` is `0` on the deployed service, so
+  nothing has executed any of it on staging. The flip (plus
+  `GOEMBEDB_S3_BUCKET`, plus scheduling the empty-store window) is an
+  operator action.
 - **No publisher has sent a real event yet.** The tenants table reads
   `count: 0`; the end-to-end smoke (force a backup failure, assert the
   Telegram message, assert the `Delivery` row) is still owed.

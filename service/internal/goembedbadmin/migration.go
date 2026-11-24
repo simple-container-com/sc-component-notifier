@@ -14,6 +14,7 @@ package goembedbadmin
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -34,9 +35,12 @@ import (
 // the operator mint and manage yet another scoped token for a
 // once-per-stack operation.
 //
-// PR B will wire this value through the SC secret-env binding so the
-// token is a SecretsManager ARN rather than plaintext; this PR reads
-// the raw env so the endpoint is testable from day one.
+// The value reaches the service through the SC secret-env binding
+// (`migrationToken:` in the component config → `ADMIN_MIGRATION_TOKEN`
+// as a SecretsManager ARN), so `main` resolves it before populating
+// AdminToken below. This struct therefore always holds PLAINTEXT — an
+// ARN here means the resolution step was skipped, and every operator
+// call will 401.
 type MigrationConfig struct {
 	// Source is the current S3Store — the fallback when USE_GOEMBEDB
 	// is absent. Must be populated during cutover even when the
@@ -105,7 +109,11 @@ func (c *MigrationConfig) Migrate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "migration endpoint disabled (ADMIN_MIGRATION_TOKEN unset)")
 		return
 	}
-	if r.Header.Get("X-Admin-Token") != c.AdminToken {
+	// Constant-time, matching the operator-password login: this is a
+	// shared bearer with no accounts and no lockout, so a length- or
+	// prefix-leaking compare is the only thing between it and an
+	// offline-free guessing oracle.
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Admin-Token")), []byte(c.AdminToken)) != 1 {
 		writeErr(w, http.StatusUnauthorized, "missing or invalid X-Admin-Token")
 		return
 	}
