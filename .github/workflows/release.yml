@@ -180,6 +180,29 @@ jobs:
         with:
           sc-config: ${{ secrets.SC_CONFIG }}
 
+      # `service/go.mod` requires the PRIVATE go-embedb module, so the
+      # builder stage's `go mod download` needs the deploy key mounted
+      # as a buildkit secret (service/Dockerfile:86). Without it the
+      # build dies on `git@github.com: Permission denied (publickey)`
+      # — which is how release 1f96ced failed: PR + CI both grew the
+      # reveal when the private dep landed, and this job did not, so
+      # the first release after the go-embedb merge built every binary,
+      # published the GitHub Release, and then failed on the image.
+      #
+      # `dockerhub-login` above already reveals nothing but its own
+      # token, so the reveal has to be explicit here. Same three lines
+      # as pr.yml's image job and ci.yml's service job — the `chmod` is
+      # load-bearing (reveal writes 0644 and ssh refuses a
+      # world-readable key).
+      - name: Reveal the go-embedb deploy key
+        env:
+          SIMPLE_CONTAINER_CONFIG: ${{ secrets.SC_CONFIG }}
+        run: |
+          set -euo pipefail
+          sc secrets reveal --force
+          test -s .sc/deploy-keys/go-embedb.pem
+          chmod 600 .sc/deploy-keys/go-embedb.pem
+
       - uses: docker/setup-buildx-action@v3
 
       # `cache-to: mode=max` writes every stage, so a subsequent run
@@ -199,6 +222,8 @@ jobs:
           push: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          secret-files: |
+            go_embedb_key=.sc/deploy-keys/go-embedb.pem
           build-args: |
             VERSION=${{ needs.version.outputs.version }}
             COMMIT=${{ github.sha }}
