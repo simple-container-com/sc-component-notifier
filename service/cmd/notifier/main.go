@@ -36,10 +36,15 @@
 //	                                 See README.md §Storage + the
 //	                                 sc-component-notifier-goembedb-migration
 //	                                 roadmap item.
-//	GOEMBEDB_S3_BUCKET               replication substrate bucket (optional; when
-//	                                 absent the embed runs single-node — no
-//	                                 cross-container durability, intended for
-//	                                 smoke / dev).
+//	GOEMBEDB_S3_BUCKET               replication substrate bucket. HARD-REQUIRED
+//	                                 on Lambda: with USE_GOEMBEDB=1 and no bucket
+//	                                 the service REFUSES TO BOOT
+//	                                 ("GOEMBEDB_S3_BUCKET is required on Lambda
+//	                                 …"), because `/tmp` is per-container and
+//	                                 ephemeral, which defeats the single-flight
+//	                                 tick lease and idempotency expiry. Optional
+//	                                 only off Lambda (ECS / VM / local smoke),
+//	                                 where it warns and runs single-node.
 //	GOEMBEDB_S3_PREFIX               key namespace under the replication bucket
 //	                                 (default sc-component-notifier/).
 //	GOEMBEDB_S3_REGION               region for the replication bucket (default
