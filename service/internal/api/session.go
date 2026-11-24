@@ -46,6 +46,22 @@ type SessionConfig struct {
 
 	// CookieTTL defaults to 12h.
 	CookieTTL time.Duration
+
+	// Version is the build stamp (`main.version`, CalVer
+	// `vYYYY.MM.DD-<short-sha>`), so the SPA can show which build is
+	// serving the page it is rendering.
+	//
+	// The same value is on `/healthz`, which is where a credential-free
+	// smoke reads it; see Healthz for why a pin bump was otherwise
+	// unverifiable from outside. This copy is for the operator UI, not
+	// for the smoke.
+	//
+	// Not gated on the session. It was, briefly, on the reasoning that
+	// the value is an exact commit SHA of a private repo — but CalVer
+	// already CONTAINS the short SHA, so the gate withheld nothing that
+	// `/healthz` does not hand out anyway, while making the field
+	// useless for the credential-free case it exists for.
+	Version string
 }
 
 func (c *SessionConfig) cookieTTL() time.Duration {
@@ -68,9 +84,12 @@ func (c *SessionConfig) Session(w http.ResponseWriter, r *http.Request) {
 	if raw := tokenFromRequest(r); raw != "" {
 		authed = c.verifyOperator(raw)
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"authenticated": authed,
 		"password_set":  c.OperatorPassword != "",
+		// Not bool, hence the `any`-typed map: the probe is no longer
+		// an all-bool response.
+		"version": c.Version,
 	})
 }
 

@@ -16,6 +16,10 @@ export interface SessionInfo {
   // configured, which is a different problem from a wrong one — see the
   // Go side's SessionConfig.Session.
   password_set: boolean
+  // The build serving this page, CalVer `vYYYY.MM.DD-<short-sha>`.
+  // Optional because an older deployed build does not send it — not
+  // because it is conditional on auth.
+  version?: string
 }
 
 export interface TenantRecord {

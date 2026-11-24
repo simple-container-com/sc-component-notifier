@@ -49,10 +49,29 @@ export function App() {
             webhooks.
           </p>
         </div>
+        {/*
+          The build serving this page. Small and grey on purpose — it is
+          not information an operator needs while working, but it tells
+          them at a glance whether the page they are looking at came
+          from the build they just merged. A scripted smoke reads the
+          same value off /healthz instead.
+        */}
+        {session.data.version && (
+          <code
+            style={{ marginLeft: 'auto', color: '#999', fontSize: '0.8rem' }}
+            title="Build serving this page"
+          >
+            {session.data.version}
+          </code>
+        )}
         <button
           onClick={() => logout.mutate()}
           disabled={logout.isPending}
-          style={{ marginLeft: 'auto', padding: '0.35rem 0.75rem', cursor: 'pointer' }}
+          style={{
+            marginLeft: session.data.version ? undefined : 'auto',
+            padding: '0.35rem 0.75rem',
+            cursor: 'pointer',
+          }}
         >
           Sign out
         </button>
