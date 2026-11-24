@@ -118,6 +118,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # This job's whole value is being a dry run of release.yml's image
+      # build, and that only holds while the two pass the same build
+      # inputs. They diverged once: the go-embedb private dep landed
+      # with the reveal + `go_embedb_key` secret here and in ci.yml but
+      # NOT in release.yml, so this job stayed green on PR #2 and the
+      # release that merged it failed in `go mod download` after
+      # publishing the GitHub Release and every binary. A green dry run
+      # that cannot predict the real build is worse than no dry run, so
+      # assert the mount exists on both sides rather than trusting the
+      # comment that says they match.
+      - name: release.yml mounts the same build secret as this job
+        run: |
+          set -euo pipefail
+          for wf in pr.yml release.yml; do
+            grep -q 'go_embedb_key=\.sc/deploy-keys/go-embedb\.pem' ".github/workflows/$wf" || {
+              echo "::error file=.github/workflows/$wf::does not mount go_embedb_key for the service image build — service/go.mod needs the private go-embedb module and the build will fail on 'git@github.com: Permission denied (publickey)'"
+              exit 1
+            }
+          done
+
       - uses: simple-container-com/actions/install-sc@main
       - name: Reveal the go-embedb deploy key
         env:
