@@ -24,7 +24,7 @@ Three failure modes this harness reports, which are easy to confuse:
                 test: it burns the whole CI timeout and reports
                 nothing. Fix the test's synchronisation.
 
-It covers BOTH the service and plugin modules (see MODULES). The plugin
+It covers BOTH the service and plugin modules. The plugin
 half earns its place: the `plugin/dependency outputs read off the
 pointer, not .Ref` entry encodes a branch that was dead in TWO shipped
 components — lookupDepString type-asserted an `*api.ResourceOutput`
@@ -89,7 +89,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 # of them. File paths below are REPO-relative and their first segment
 # names the module, which is also the directory `go test` runs in — a
 # plugin mutation tested from service/ would simply not find the package.
-MODULES = ("service", "plugin")
+# A cross-module contract test is the one exception and says so by
+# prefixing its package with the module it runs in ("plugin:./cmd/...").
 
 EVENTS = "./internal/events/"
 TG_PKG = "./internal/channel/telegram/"
@@ -98,7 +99,17 @@ CRYPTO_PKG = "./internal/crypto/"
 REG_PKG = "./internal/registry/"
 API_PKG = "./internal/api/"
 TENANT_PKG = "./internal/tenant/"
+ADMIN_PKG = "./internal/goembedbadmin/"
 PLUGIN_PKG = "./internal/"
+PLG_CMD_PKG = "./cmd/sc-component-notifier/"
+
+# A test package that lives in a DIFFERENT module from the file being
+# mutated is written "<module>:<pkg>" — see the module resolution in
+# main(). Only one guard needs it, and it needs it for a real reason:
+# the secret-env binding is declared in the plugin module and consumed
+# in the service module, so the contract test that spans them can only
+# live on one side.
+PLG_CMD_PKG_XMOD = "plugin:" + PLG_CMD_PKG
 
 ROUTER = "service/internal/events/router.go"
 DRAIN = "service/internal/events/drain.go"
@@ -116,11 +127,14 @@ TICK = "service/internal/api/scheduler_tick.go"
 SESSION = "service/internal/api/session.go"
 JWTMW = "service/internal/api/jwt_middleware.go"
 TENANTS_LIST = "service/internal/api/tenants_list.go"
+ADMIN = "service/internal/goembedbadmin/migration.go"
+SVC_MAIN = "service/cmd/notifier/main.go"
 
 PLG_CONFIG = "plugin/internal/config.go"
 PLG_CHANNELS = "plugin/internal/channels_cfg.go"
 PLG_TENANTENV = "plugin/internal/tenant_env.go"
 PLG_COMPUTE = "plugin/internal/compute.go"
+PLG_MAIN = "plugin/cmd/sc-component-notifier/main.go"
 
 # (group, name, file, test-package, find, replace, test-regex, occurrences)
 MUTATIONS = [
@@ -817,6 +831,64 @@ MUTATIONS = [
      '\t\treturn nil, errors.Wrapf(err, "component %q unable to resolve service URL", resName)\n\t}',
      "\tserviceURL, _ := p.readServiceURL(input, params)",
      "TestUnresolvableWiringStillFailsTheDeploy", 1),
+
+    # ------------------------------------------------------- secret-env wire
+    # Schema() is the component's published API and it is two plain maps
+    # with nothing keeping them consistent. Both ways they drift are
+    # silent at deploy time.
+
+    # Core dual-uses ComponentAllowedOverrides as the allowed-top-level-
+    # keys check, so a bound key that is not on it is refused at PARSE
+    # time with "unknown or disallowed top-level key" — the operator
+    # cannot write the line, and the binding can never fire.
+    ("plugin", "secret bound to a key the operator cannot write", PLG_MAIN, PLG_CMD_PKG,
+     '\t\t\t\t"migrationToken",\n', "",
+     "TestSecretEnvKeysAreOperatorWritable", 1),
+
+    ("plugin", "two config keys bound to one env var", PLG_MAIN, PLG_CMD_PKG,
+     '"migrationToken": "ADMIN_MIGRATION_TOKEN"', '"migrationToken": "SERVICE_JWT_SECRET"',
+     "TestSecretEnvVarNamesAreSane", 1),
+
+    # The cross-module one, and the only mutation here that names its
+    # test's module explicitly. A bound secret arrives as a
+    # SecretsManager ARN; a service that reads it with a bare os.Getenv
+    # compares against the ARN string forever, logs nothing, and looks
+    # exactly like a working deploy. Live-caught twice already —
+    # signingKey on backup-smoke-1d 2026-11-14, then
+    # NOTIFIER_OPERATOR_PASSWORD on the first backup.simple-forge.com
+    # login 2026-11-18.
+    ("plugin", "bound secret read as raw env by the service", SVC_MAIN, PLG_CMD_PKG_XMOD,
+     '\t\tadminToken, rErr := resolveAWSSecretARN(ctx, "ADMIN_MIGRATION_TOKEN", rawAdminToken)',
+     "\t\tadminToken, rErr := rawAdminToken, error(nil)",
+     "TestSecretEnvVarsAreResolvedByTheService", 1),
+
+    # ------------------------------------------------------- goembedbadmin
+    # The migration endpoint reads every key out of S3 and upserts it
+    # into the live store, and it is deliberately NOT behind the service
+    # JWT. The three checks at the top of Migrate are its entire access
+    # control.
+    ("goembedbadmin", "migration token compare accepts anything", ADMIN, ADMIN_PKG,
+     "[]byte(c.AdminToken)) != 1 {", "[]byte(c.AdminToken)) == -1 {",
+     "TestMigrate_WrongOrMissingToken_Is401", 1),
+
+    # The other direction: a compare that rejects a correct token would
+    # make the cutover impossible, and "my token is wrong" is the first
+    # thing an operator would believe.
+    ("goembedbadmin", "migration token compare rejects everything", ADMIN, ADMIN_PKG,
+     "[]byte(c.AdminToken)) != 1 {", "[]byte(c.AdminToken)) != -1 {",
+     "TestMigrate_MatchingToken_PassesAuth", 1),
+
+    # Removing the opt-in gate does not open the route to anyone with a
+    # token — it opens it to a request with NO header at all, because an
+    # empty configured token and an empty header compare equal. So the
+    # gate is not politeness about 404-vs-401; it is the thing standing
+    # between an unconfigured deploy and an unauthenticated migration.
+    ("goembedbadmin", "opt-in gate removed", ADMIN, ADMIN_PKG,
+     '\tif c.AdminToken == "" {\n'
+     '\t\twriteErr(w, http.StatusNotFound, "migration endpoint disabled (ADMIN_MIGRATION_TOKEN unset)")\n'
+     "\t\treturn\n\t}\n",
+     "",
+     "TestMigrate_NoTokenConfigured_Is404", 1),
 ]
 
 TEST_FILE_PREFIXES = (
@@ -824,7 +896,7 @@ TEST_FILE_PREFIXES = (
     "telegram_test.go:", "webhook_test.go:", "seal_test.go:", "store_blob_test.go:",
     "registry_test.go:", "events_ingest_test.go:", "scheduler_tick_test.go:",
     "config_test.go:", "channels_cfg_test.go:", "tenant_env_test.go:", "compute_test.go:",
-    "compute_wiring_test.go:",
+    "compute_wiring_test.go:", "schema_test.go:", "migration_auth_test.go:",
 )
 COMPILE_MARKERS = ("build failed", "undefined:", "declared and not used", "cannot use")
 
@@ -876,19 +948,36 @@ def main() -> int:
     # plugin/internal/channels_cfg.go mutated, and only `git status` said so.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(130))
 
+    # Back up exactly the files this run will mutate, rather than each
+    # module's whole internal/ tree. Guards worth mutating also live
+    # OUTSIDE internal/ — Schema's allowlist and secret-env map in
+    # plugin/cmd/, the secret resolve in service/cmd/ — and with a
+    # tree copy keyed on internal/ the restore below raises
+    # FileNotFoundError for those and leaves the file mutated. Backing
+    # up by path covers both, and the harness only ever writes files
+    # named in MUTATIONS, so it loses no insurance.
     backup = pathlib.Path(tempfile.mkdtemp(prefix="mutation-check-"))
-    for mod in MODULES:
-        shutil.copytree(ROOT / mod / "internal", backup / mod / "internal")
+    mutated_files = sorted({m[2] for m in muts})
+    for rel in mutated_files:
+        (backup / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / rel, backup / rel)
 
     problems = []
     try:
         for group, name, rel, pkg, find, repl, test, want in muts:
             label = f"{group}/{name}"
             path = ROOT / rel
-            # The module the file belongs to is also the directory the
-            # test has to run in: each module has its own go.mod, so
-            # `go test ./internal/` resolves differently per module.
-            module = ROOT / rel.split("/", 1)[0]
+            # The module the file belongs to is normally also the
+            # directory the test has to run in: each module has its own
+            # go.mod, so `go test ./internal/` resolves differently per
+            # module. The exception is a cross-module contract test (the
+            # plugin asserting something about the service's source),
+            # which names its module as "<module>:<pkg>".
+            if ":" in pkg:
+                mod_name, pkg = pkg.split(":", 1)
+            else:
+                mod_name = rel.split("/", 1)[0]
+            module = ROOT / mod_name
             src = path.read_text()
             if src.count(find) != want:
                 print(f"STALE       {label}")
@@ -928,11 +1017,17 @@ def main() -> int:
             if msg:
                 print(f"              → {msg[:160]}")
     finally:
-        # Belt and braces: restore everything, so a crash or a Ctrl-C
-        # mid-run cannot leave a mutated file behind.
-        for mod in MODULES:
-            shutil.rmtree(ROOT / mod / "internal")
-            shutil.copytree(backup / mod / "internal", ROOT / mod / "internal")
+        # Belt and braces: restore every file this run could have
+        # touched, so a crash or a Ctrl-C mid-run cannot leave a mutated
+        # file behind. By path, for the same reason the backup is — the
+        # earlier version rmtree'd each module's internal/ and copied a
+        # per-module tree back, which on a filtered run (`mutation-check.py
+        # goembedbadmin`, one backed-up file under service/internal)
+        # DELETED the rest of that tree and then raised
+        # FileNotFoundError on a module with no backup at all. A cleanup
+        # path that can destroy source is worse than no cleanup path.
+        for rel in mutated_files:
+            shutil.copyfile(backup / rel, ROOT / rel)
         shutil.rmtree(backup, ignore_errors=True)
 
     print()
