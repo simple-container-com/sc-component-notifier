@@ -53,9 +53,10 @@
 //	                                 is set).
 //	ADMIN_MIGRATION_TOKEN            opt-in bearer that gates
 //	                                 POST /admin/migrate-s3-to-goembedb; empty
-//	                                 disables the endpoint. Read as raw env in
-//	                                 PR 1; PR B wires it through the SC secret
-//	                                 bind so the value arrives as an ARN.
+//	                                 disables the endpoint. Bound from the
+//	                                 component's `migrationToken:` through the
+//	                                 SC secret-env wire, so it arrives as a
+//	                                 SecretsManager ARN and is resolved below.
 //	PORT                             listen port            (default 8080)
 //	LOCAL_DEBUG                      "true" => serve ordinary HTTP on $PORT.
 //	                                 Anything else (including unset) means the
@@ -325,7 +326,19 @@ func main() {
 	// cutover, NOT a steady-state route. Source may be nil if
 	// USE_GOEMBEDB=1 was deployed without STORAGE_BUCKET, in which case
 	// the endpoint returns a 500 that names what is missing.
-	if adminToken := os.Getenv("ADMIN_MIGRATION_TOKEN"); adminToken != "" {
+	if rawAdminToken := os.Getenv("ADMIN_MIGRATION_TOKEN"); rawAdminToken != "" {
+		// Resolved here rather than beside the other two secrets at
+		// startup: an operator who never opted in pays no
+		// SecretsManager call, and a value that IS an ARN proves the
+		// opt-in already happened. Exit 2 on failure for the reason
+		// secret_resolver.go gives — comparing `X-Admin-Token` against
+		// an unresolved ARN would 401 every operator call with nothing
+		// in the log to say why.
+		adminToken, rErr := resolveAWSSecretARN(ctx, "ADMIN_MIGRATION_TOKEN", rawAdminToken)
+		if rErr != nil {
+			slog.Error("could not resolve ADMIN_MIGRATION_TOKEN", "err", rErr)
+			os.Exit(2)
+		}
 		migration := &goembedbadmin.MigrationConfig{
 			Source:     migrationSource,
 			Sink:       migrationSink,

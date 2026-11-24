@@ -263,6 +263,12 @@ func (p *notifierPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) 
 				// route, so the credential sitting in the rule's input
 				// can only drain the queue.
 				"schedulerToken",
+				// The `X-Admin-Token` bearer for the one-off S3 →
+				// go-embedb migration endpoint. Absent means the
+				// service never registers the route, which is why this
+				// is the one credential an operator is expected to
+				// DELETE from config once the cutover is done.
+				"migrationToken",
 				// Grandfather for the aws-lambda template's
 				// per-Component resource naming (sc-plugin-aws#28):
 				// keeps a Component deployed BEFORE that scoping on its
@@ -291,10 +297,22 @@ func (p *notifierPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) 
 		// accepts AND the KEK under which SPA-written channel
 		// credentials are sealed, so it is the one value that must
 		// never travel as plain env.
+		//
+		// Every entry here is a contract with BOTH sides, and the
+		// service half is the half that gets forgotten: the binding
+		// delivers an ARN, and a service that reads the var with a bare
+		// os.Getenv compares against the ARN string forever. That has
+		// been live-caught twice in this fleet (see the call-site list
+		// in service/cmd/notifier/secret_resolver.go), so
+		// TestSecretEnvVarsAreResolvedByTheService asserts each name
+		// below reaches resolveAWSSecretARN.
 		ComponentSecretEnvMap: map[string]*scpluginv1.StringMap{
 			notifierApi.ResourceType: {Entries: map[string]string{
 				"signingKey":       "SERVICE_JWT_SECRET",
 				"operatorPassword": "NOTIFIER_OPERATOR_PASSWORD",
+				// Opt-in, and the only entry whose absence is the
+				// intended steady state — no value, no route.
+				"migrationToken": "ADMIN_MIGRATION_TOKEN",
 			}},
 		},
 	}, nil
