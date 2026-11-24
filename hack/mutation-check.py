@@ -102,6 +102,15 @@ TENANT_PKG = "./internal/tenant/"
 ADMIN_PKG = "./internal/goembedbadmin/"
 PLUGIN_PKG = "./internal/"
 PLG_CMD_PKG = "./cmd/sc-component-notifier/"
+# The SERVICE module's cmd package. Easy to confuse with PLG_CMD_PKG
+# above — both are "the cmd package", and reaching for the wrong one
+# does not fail loudly: the mutation still applies (the find string is
+# in the service's main.go), the harness runs a test package in the
+# OTHER module where that test name does not exist, `go test -run`
+# reports "no tests to run" and exits 0, and the entry lands as NOT
+# CAUGHT rather than as a mistake in the entry. Live-caught writing the
+# version-wire guard below.
+SVC_CMD_PKG = "./cmd/notifier/"
 
 # A test package that lives in a DIFFERENT module from the file being
 # mutated is written "<module>:<pkg>" — see the module resolution in
@@ -125,6 +134,7 @@ TENANT = "service/internal/tenant/store_blob.go"
 INGEST = "service/internal/api/events_ingest.go"
 TICK = "service/internal/api/scheduler_tick.go"
 SESSION = "service/internal/api/session.go"
+HEALTHZ = "service/internal/api/healthz.go"
 JWTMW = "service/internal/api/jwt_middleware.go"
 TENANTS_LIST = "service/internal/api/tenants_list.go"
 ADMIN = "service/internal/goembedbadmin/migration.go"
@@ -889,6 +899,42 @@ MUTATIONS = [
      "\t\treturn\n\t}\n",
      "",
      "TestMigrate_NoTokenConfigured_Is404", 1),
+
+    # The build stamp. Three guards, and the surface that matters is
+    # /healthz: it is the only probe a post-deploy smoke can reach with
+    # no credential at all, which is the whole reason the field exists.
+    ("session", "healthz stops reporting the build", HEALTHZ, API_PKG,
+     '\t\t\t"version": version,\n', "",
+     "TestHealthz_CarriesTheBuildAndStillSaysOK", 1),
+
+    # The status field is what the Lambda health check and
+    # lambda_runtime_test.go match on, and renaming it would leave a
+    # 200 with a plausible-looking body — a probe that passes while
+    # saying nothing.
+    ("session", "healthz stops saying ok", HEALTHZ, API_PKG,
+     '"status":  "ok",', '"state":  "ok",',
+     "TestHealthz_CarriesTheBuildAndStillSaysOK", 1),
+
+    ("session", "session probe stops reporting the build", SESSION, API_PKG,
+     '\t\t"version": c.Version,\n', "",
+     "TestSession_ReportsTheBuildVersion", 1),
+
+    # And the two wires. Both are in main.go and NEITHER is visible to a
+    # handler test: every test in internal/api constructs its own
+    # handler, so all of them pass with main.go never passing `version`
+    # at all. That is the exact shape of the bug this repo has shipped
+    # twice (`signingKey` as a bare ARN, then
+    # NOTIFIER_OPERATOR_PASSWORD) — a value present, correct, and read
+    # by nothing, logging identically to a working deploy. Hence a
+    # binary test.
+    ("session", "healthz wired without the version", SVC_MAIN, SVC_CMD_PKG,
+     "mux.Get(\"/healthz\", api.Healthz(version))",
+     "mux.Get(\"/healthz\", api.Healthz(\"\"))",
+     "TestBinaryReportsItsBuildOnHealthzAndSession", 1),
+
+    ("session", "session wired without the version", SVC_MAIN, SVC_CMD_PKG,
+     "\t\tVersion: version,\n", "",
+     "TestBinaryReportsItsBuildOnHealthzAndSession", 1),
 ]
 
 TEST_FILE_PREFIXES = (
@@ -897,6 +943,7 @@ TEST_FILE_PREFIXES = (
     "registry_test.go:", "events_ingest_test.go:", "scheduler_tick_test.go:",
     "config_test.go:", "channels_cfg_test.go:", "tenant_env_test.go:", "compute_test.go:",
     "compute_wiring_test.go:", "schema_test.go:", "migration_auth_test.go:",
+    "session_test.go:", "version_wire_test.go:",
 )
 COMPILE_MARKERS = ("build failed", "undefined:", "declared and not used", "cannot use")
 

@@ -314,7 +314,10 @@ func main() {
 	mux.Use(middleware.Recoverer)
 	mux.Use(requestLogger)
 
-	mux.Get("/healthz", api.Healthz)
+	// The build stamp goes on /healthz because that is the only probe a
+	// post-deploy smoke can reach with no credentials at all — see
+	// api.Healthz for the pin bump that was unverifiable without it.
+	mux.Get("/healthz", api.Healthz(version))
 
 	// Prometheus text-exposition. Unauthenticated: exposes process-level
 	// counters + the notifier_store_backend{backend="s3"|"goembedb"}
@@ -359,6 +362,9 @@ func main() {
 		// Secure cookies except in local HTTP development. Lambda is
 		// always behind TLS, so this is on in every deployed shape.
 		CookieSecure: os.Getenv("LOCAL_DEBUG") != "true",
+		// So the SPA header can show which build is serving the page.
+		// The smoke reads the same value off /healthz above.
+		Version: version,
 	}
 	mux.Get("/api/v1/session", session.Session)
 	mux.Post("/api/v1/login", session.Login)
