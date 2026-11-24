@@ -33,6 +33,7 @@ import (
 	"github.com/simple-container-com/sc-component-notifier/service/internal/channel/webhook"
 	"github.com/simple-container-com/sc-component-notifier/service/internal/crypto"
 	"github.com/simple-container-com/sc-component-notifier/service/internal/events"
+	"github.com/simple-container-com/sc-component-notifier/service/internal/mongox"
 )
 
 // CredentialScope is the seal scope for SPA-written channel credentials.
@@ -72,15 +73,20 @@ type Managed struct {
 	URL    string
 }
 
-// Logger is the minimal logging seam, matching events.Logger.
+// Logger is the minimal logging seam. A superset of events.Logger —
+// Warnf was added for the one condition that is neither routine nor an
+// error: a boot that could not write because it does not hold the
+// go-embedb write lease (see Seed).
 type Logger interface {
 	Infof(format string, args ...any)
+	Warnf(format string, args ...any)
 	Errorf(format string, args ...any)
 }
 
 type nopLogger struct{}
 
 func (nopLogger) Infof(string, ...any)  {}
+func (nopLogger) Warnf(string, ...any)  {}
 func (nopLogger) Errorf(string, ...any) {}
 
 // Registry resolves the live channel set.
@@ -180,6 +186,25 @@ func (r *Registry) Seed(ctx context.Context) error {
 			rec.CreatedAt = prev.CreatedAt
 		}
 		if err := r.store.PutChannel(ctx, rec); err != nil {
+			// A replica that does not hold the go-embedb write lease
+			// cannot seed, and must not die trying. PutChannel is an
+			// upsert, which go-embedb classifies RMW and refuses on a
+			// non-owner with NotWritablePrimary(10107) — see the long
+			// rationale on mongox.TolerateNotWritablePrimary. Seeding
+			// is idempotent and the owner's write replicates, so the
+			// declaration still lands; this replica simply is not the
+			// one that lands it. Treating it as fatal is what took
+			// sc-component-backup down on 2026-11-24, and this call is
+			// the notifier's own instance of the same shape (live-caught
+			// 2026-11-24 16:21Z, five crashed boots in one minute,
+			// immediately after the index-create sites were fixed).
+			if mongox.IsNotWritablePrimary(err) {
+				r.log.Warnf("channel %q not seeded by this replica: it does not hold the "+
+					"go-embedb write lease; the lease owner seeds it and the write replicates", name)
+
+				continue
+			}
+
 			return fmt.Errorf("seed channel %q: %w", name, err)
 		}
 	}
@@ -191,6 +216,11 @@ func (r *Registry) Seed(ctx context.Context) error {
 		if _, stillDeclared := r.managed[c.Name]; stillDeclared {
 			continue
 		}
+		// No NotWritablePrimary guard here, deliberately: this lands on
+		// MongoStore.Delete → DeleteOne, and go-embedb classifies the
+		// `delete` wire op last-write-wins, not RMW. Any replica may
+		// run it. A guard would be unreachable code no fixture could
+		// exercise.
 		if err := r.store.DeleteChannel(ctx, c.Name); err != nil {
 			return fmt.Errorf("remove undeclared managed channel %q: %w", c.Name, err)
 		}
