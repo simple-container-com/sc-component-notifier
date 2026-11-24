@@ -71,6 +71,8 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+
+	"github.com/simple-container-com/sc-component-notifier/service/internal/mongox"
 )
 
 // ErrPresignUnsupported is returned by MongoStore.Presign.
@@ -129,6 +131,14 @@ func (s *MongoStore) WithDatabase(name string) *MongoStore {
 // Called at boot by cmd/notifier/boot_goembedb.go. Separated from
 // NewMongoStore so unit tests can opt into (or out of) TTL depending
 // on what they are exercising.
+//
+// NotWritablePrimary is tolerated: `createIndexes` is DDL, go-embedb
+// grants one write lease per tenant, and on Lambda the refusal cannot
+// be redirected to the owner (every slot advertises `127.0.0.1:0`). A
+// non-owner execution environment must boot and serve reads rather than
+// exit — see mongox.TolerateNotWritablePrimary for the outage this
+// shape caused in sc-component-backup. Every OTHER error still fails
+// the boot, including the spec conflict above.
 func (s *MongoStore) EnsureIndexes(ctx context.Context) error {
 	for _, name := range []string{CollectionEvents, CollectionCooldown} {
 		coll := s.client.Database(s.dbName).Collection(name)
@@ -136,7 +146,7 @@ func (s *MongoStore) EnsureIndexes(ctx context.Context) error {
 			Keys:    bson.D{{Key: "expiresAt", Value: 1}},
 			Options: options.Index().SetName("expiresAt_ttl").SetExpireAfterSeconds(0),
 		})
-		if err != nil {
+		if err = mongox.TolerateNotWritablePrimary(name+".expiresAt_ttl", err); err != nil {
 			return fmt.Errorf("storage.MongoStore: ensure TTL index on %s: %w", name, err)
 		}
 	}

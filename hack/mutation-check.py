@@ -100,6 +100,7 @@ REG_PKG = "./internal/registry/"
 API_PKG = "./internal/api/"
 TENANT_PKG = "./internal/tenant/"
 ADMIN_PKG = "./internal/goembedbadmin/"
+MONGOX_PKG = "./internal/mongox/"
 PLUGIN_PKG = "./internal/"
 PLG_CMD_PKG = "./cmd/sc-component-notifier/"
 # The SERVICE module's cmd package. Easy to confuse with PLG_CMD_PKG
@@ -139,6 +140,9 @@ JWTMW = "service/internal/api/jwt_middleware.go"
 TENANTS_LIST = "service/internal/api/tenants_list.go"
 ADMIN = "service/internal/goembedbadmin/migration.go"
 SVC_MAIN = "service/cmd/notifier/main.go"
+# The NotWritablePrimary classification that lets a non-lease-owner
+# execution environment boot. Mutated below in both directions.
+MONGOX = "service/internal/mongox/notprimary.go"
 
 PLG_CONFIG = "plugin/internal/config.go"
 PLG_CHANNELS = "plugin/internal/channels_cfg.go"
@@ -935,6 +939,54 @@ MUTATIONS = [
     ("session", "session wired without the version", SVC_MAIN, SVC_CMD_PKG,
      "\t\tVersion: version,\n", "",
      "TestBinaryReportsItsBuildOnHealthzAndSession", 1),
+
+    # ------------------------------------------------------------- mongox
+    # go-embedb grants ONE write lease per tenant and classifies every
+    # DDL op — createIndexes included — as RMW, so a non-owner replica
+    # is refused with NotWritablePrimary(10107). On Lambda the refusal
+    # is a dead end rather than a "retry at the primary": each exec env
+    # is its own VM with no inbound path, so every slot advertises
+    # 127.0.0.1:0 and the `primary` hint can never be dialled.
+    #
+    # MongoStore.EnsureIndexes creates two TTL indexes and main.go
+    # os.Exit(2)s on failure. That exact shape took sc-component-backup
+    # down for over an hour on 2026-11-24: every non-owner env died
+    # ~880ms into init, Lambda answered the resulting 502 by spawning
+    # another env, and the loop reached five slots and epoch 43 without
+    # self-healing. The notifier was green only because its traffic has
+    # never driven concurrency above one — not a property worth
+    # depending on.
+    #
+    # Mutated in BOTH directions because both are live failure modes
+    # that look nothing alike in production: swallow-nothing is the
+    # outage above, swallow-everything hides an IndexOptionsConflict (a
+    # changed expireAfterSeconds) behind a WARN and boots with the TTL
+    # sweep silently on the old spec.
+    #
+    # NOT covered here: EnsureIndexes dropping the mongox call entirely.
+    # There is no honest unit test for it — the storage tests run
+    # against a real embedded go-embedb, which is always its own lease
+    # owner, so no fixture can make CreateOne return 10107. An entry
+    # without a test that can catch it would land as NOT CAUGHT and
+    # teach the next reader to ignore this harness.
+    ("mongox", "NotWritablePrimary treated as fatal again (the outage)", MONGOX, MONGOX_PKG,
+     "\tif IsNotWritablePrimary(err) {",
+     "\tif false {",
+     "TestTolerateNotWritablePrimary", 1),
+
+    ("mongox", "every index error swallowed, not just 10107", MONGOX, MONGOX_PKG,
+     "\tif IsNotWritablePrimary(err) {",
+     "\tif err != nil {",
+     "TestTolerateNotWritablePrimary", 1),
+
+    # The wire code itself. 10107 is owned by go-embedb's
+    # handlererrors.ErrNotWritablePrimary, not by this package, so the
+    # test asserts it against a LITERAL — a fixture built from this
+    # const would move with it and prove only self-consistency.
+    ("mongox", "wire code drifts off 10107", MONGOX, MONGOX_PKG,
+     "const codeNotWritablePrimary = 10107",
+     "const codeNotWritablePrimary = 10108",
+     "TestCodeMatchesWireSpec|TestIsNotWritablePrimary", 1),
 ]
 
 TEST_FILE_PREFIXES = (
