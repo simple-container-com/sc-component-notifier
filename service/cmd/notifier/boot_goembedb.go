@@ -123,6 +123,21 @@ func bootGoEmbedOnce(logger *slog.Logger) (*goEmbed, error) {
 		// case — notifier IS a Lambda — gets Bug 13 right without the
 		// operator remembering it.
 		if isLambda() {
+			// 3m, and the number is DERIVED: it must be >= 3x the
+			// cadence of whatever drives the renewal. Since 2026-11-25
+			// that is the `nt-tick` EventBridge rule — `rate(1 minute)`
+			// — not the engine's 30-second heartbeat interval, because
+			// Lambda freezes the ticker goroutine and the renewal now
+			// happens synchronously inside DeliveryTick.
+			//
+			// So this value is correct only while nt-tick stays at one
+			// minute. If that rate is ever relaxed, raise this with it:
+			// a TTL below the driving cadence leaves the slot "renewed
+			// and then expired" for most of every period, which is
+			// indistinguishable from the outside from a healthy one.
+			// Handler.TickNow measures the interval between its own
+			// calls and warns when TTL < 2x the observed cadence, so
+			// the drift is at least loud.
 			if rep.HeartbeatTTL == 0 {
 				rep.HeartbeatTTL = 3 * time.Minute
 			}

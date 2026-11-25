@@ -181,6 +181,13 @@ func main() {
 		target          string
 		migrationSource storage.Store
 		migrationSink   *storage.MongoStore
+
+		// replicationTick drives go-embedb's five background loops from
+		// the delivery tick. Nil unless the embed is in use — see
+		// api.DeliveryTick for why a ticker goroutine cannot do this
+		// job on Lambda. (It is the same reason this service has no
+		// ticker of its own.)
+		replicationTick func(context.Context) error
 	)
 	useGoEmbedb := strings.TrimSpace(os.Getenv("USE_GOEMBEDB")) == "1"
 
@@ -236,6 +243,7 @@ func main() {
 		migrationSink = mongoStore
 		objects = mongoStore
 		target = "goembedb://" + embed.ReplSet
+		replicationTick = embed.FDB.TickNow
 	}
 
 	if objects == nil {
@@ -380,7 +388,7 @@ func main() {
 		r.Post("/api/v1/tenants/register", api.TenantsRegister(tenantStore))
 		r.Get("/api/v1/tenants", api.TenantsList(tenantStore))
 		r.Post("/api/v1/events", api.EventsIngest(eventStore, router, reg, tenantStore, nil))
-		r.Post("/api/v1/scheduler/delivery/tick", api.DeliveryTick(drainer))
+		r.Post("/api/v1/scheduler/delivery/tick", api.DeliveryTick(drainer, replicationTick))
 	})
 
 	spaFS, err := fs.Sub(ui.BuildFS, "dist")

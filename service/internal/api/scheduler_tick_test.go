@@ -29,9 +29,14 @@ func (s *stubDrainer) Drain(context.Context) (events.DrainResult, error) {
 
 func tick(t *testing.T, drainer Draining, op string) *httptest.ResponseRecorder {
 	t.Helper()
+	return tickRep(t, drainer, nil, op)
+}
+
+func tickRep(t *testing.T, drainer Draining, rep func(context.Context) error, op string) *httptest.ResponseRecorder {
+	t.Helper()
 	mux := http.NewServeMux()
 	mux.Handle("POST /api/v1/scheduler/delivery/tick",
-		JWTMiddleware([]byte(testKey))(DeliveryTick(drainer)))
+		JWTMiddleware([]byte(testKey))(DeliveryTick(drainer, rep)))
 
 	req := httptest.NewRequest("POST", "/api/v1/scheduler/delivery/tick", nil)
 	req.Header.Set("Authorization", "Bearer "+mintOpJWT(t, op, ""))
@@ -111,7 +116,7 @@ func TestDeliveryTick_RejectsMissingToken(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.Handle("POST /api/v1/scheduler/delivery/tick",
-		JWTMiddleware([]byte(testKey))(DeliveryTick(d)))
+		JWTMiddleware([]byte(testKey))(DeliveryTick(d, nil)))
 
 	req := httptest.NewRequest("POST", "/api/v1/scheduler/delivery/tick", nil)
 	rr := httptest.NewRecorder()
@@ -119,4 +124,83 @@ func TestDeliveryTick_RejectsMissingToken(t *testing.T) {
 
 	Expect(rr.Code).To(Equal(http.StatusUnauthorized))
 	Expect(d.called).To(BeZero())
+}
+
+// TestDeliveryTick_DrivesReplicationTick is the point of the wiring: this
+// endpoint is already the notifier's clock (there is no ticker in this
+// service and must never be one), and since 2026-11-25 it is also
+// go-embedb's. The engine starts five wall-clock-ticker goroutines at
+// handler construction and Lambda freezes them when the response flushes,
+// so a loop fires only if one invocation outlives its period.
+//
+// "Called once" is not the whole assertion — the call must be BOUNDED, or
+// a snapshot plus a GC sweep on a cold bucket starves the drain that this
+// endpoint exists for.
+func TestDeliveryTick_DrivesReplicationTick(t *testing.T) {
+	RegisterTestingT(t)
+	d := &stubDrainer{res: events.DrainResult{Examined: 1}}
+
+	calls := 0
+	hadDeadline := false
+	rr := tickRep(t, d, func(ctx context.Context) error {
+		calls++
+		_, hadDeadline = ctx.Deadline()
+		return nil
+	}, "scheduler")
+
+	Expect(rr.Code).To(Equal(http.StatusOK))
+	Expect(calls).To(Equal(1), "replication tick must run exactly once per delivery tick")
+	Expect(hadDeadline).To(BeTrue(), "the replication tick must be bounded so it cannot consume the whole invocation and starve the drain")
+	Expect(d.called).To(Equal(1), "the drain must still run after the replication tick")
+}
+
+// A replication failure must not stop DELIVERY. It is retried on the next
+// tick (one minute later), whereas 500-ing here would halt the thing this
+// endpoint exists for over a transient S3 error — and the drain result is
+// what the schedule's error metric is supposed to mean.
+func TestDeliveryTick_ReplicationFailureIsNotFatal(t *testing.T) {
+	RegisterTestingT(t)
+	d := &stubDrainer{res: events.DrainResult{Examined: 2, Delivered: 2}}
+
+	rr := tickRep(t, d, func(context.Context) error {
+		return errors.New("put body: operation error S3: PutObject, StatusCode: 0")
+	}, "scheduler")
+
+	Expect(rr.Code).To(Equal(http.StatusOK))
+	Expect(d.called).To(Equal(1), "a replication failure must not skip the drain")
+
+	var res events.DrainResult
+	Expect(json.Unmarshal(rr.Body.Bytes(), &res)).To(Succeed())
+	Expect(res.Delivered).To(Equal(2))
+}
+
+// The replication tick sits BEHIND the auth gate. It issues S3 writes, so
+// an unauthenticated caller who could drive it would have a free amplifier
+// — the same reasoning that keeps the drain itself behind the gate.
+func TestDeliveryTick_ReplicationNotDrivenByAWrongOp(t *testing.T) {
+	RegisterTestingT(t)
+
+	for _, op := range []string{"event", "register", "", "admin"} {
+		d := &stubDrainer{}
+		calls := 0
+		rr := tickRep(t, d, func(context.Context) error {
+			calls++
+			return nil
+		}, op)
+
+		Expect(rr.Code).To(Equal(http.StatusForbidden), "op %q was accepted", op)
+		Expect(calls).To(BeZero(), "op %q drove the replication tick", op)
+	}
+}
+
+// Nil is the steady state on any deploy not using the embed (S3 or
+// filesystem storage), and must stay a no-op rather than a nil-call panic.
+func TestDeliveryTick_NilReplicationTickIsSkipped(t *testing.T) {
+	RegisterTestingT(t)
+	d := &stubDrainer{res: events.DrainResult{Examined: 1}}
+
+	rr := tickRep(t, d, nil, "scheduler")
+
+	Expect(rr.Code).To(Equal(http.StatusOK))
+	Expect(d.called).To(Equal(1))
 }

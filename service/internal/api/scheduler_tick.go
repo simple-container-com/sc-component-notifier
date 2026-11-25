@@ -7,6 +7,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/simple-container-com/sc-component-notifier/service/internal/events"
 )
@@ -37,12 +38,42 @@ type Draining interface {
 // looks: `{"skipped": true}` is the NORMAL answer whenever a previous
 // drain still holds the single-flight lease, and an operator reading
 // CloudWatch needs to be able to tell that apart from an error.
-func DeliveryTick(drainer Draining) http.HandlerFunc {
+//
+// replicationTick drives go-embedb's five background replication loops
+// once, synchronously; nil on any deploy not using the embed. The comment
+// above about never having a ticker applies to go-embedb's internals too,
+// and that is the whole reason this parameter exists: the engine starts
+// five wall-clock-ticker goroutines (slot heartbeat, lease renewal, reader
+// reconcile, snapshot, GC sweeper) at handler construction, and on Lambda
+// a loop fires only if ONE invocation outlives its period. Measured across
+// the fleet 2026-11-25: slots stuck at `heartbeat == joinedAt` to the
+// nanosecond — never renewed since joining — while the Lambda served
+// traffic normally. This endpoint is already the notifier's clock, so it
+// is also the engine's.
+//
+// See forge/docs/roadmap/items/go-embedb-snapshot-ticker-starves-on-lambda.md.
+func DeliveryTick(drainer Draining, replicationTick func(context.Context) error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims := ClaimsFromContext(r.Context())
 		if claims == nil || claims.Op != "scheduler" {
 			http.Error(w, "forbidden: token op must be 'scheduler'", http.StatusForbidden)
 			return
+		}
+
+		// Never fatal, and bounded independently of the drain.
+		//
+		// Not fatal because a replication error is retried on the next
+		// tick, whereas 500-ing here would stop DELIVERY — the thing
+		// this endpoint exists for — over a transient S3 error.
+		// Bounded because a snapshot plus a GC sweep on a cold bucket
+		// can outlast the Lambda timeout, and the drain must still get
+		// its share of the invocation.
+		if replicationTick != nil {
+			repCtx, repCancel := context.WithTimeout(r.Context(), 20*time.Second)
+			if err := replicationTick(repCtx); err != nil {
+				slog.WarnContext(repCtx, "delivery tick: replication tick failed", "err", err)
+			}
+			repCancel()
 		}
 
 		res, err := drainer.Drain(r.Context())
