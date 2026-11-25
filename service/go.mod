@@ -14,7 +14,7 @@ go 1.27.3
 // its `main` red on the first commit of this adoption with
 // USE_GOEMBEDB still defaulted off: the flag cannot gate a dependency
 // the module graph needs to resolve. See README.md §Storage.
-replace github.com/FerretDB/FerretDB => github.com/simple-container-com/go-embedb v0.0.0-20261124214336-b3607f5d06ea
+replace github.com/FerretDB/FerretDB => github.com/simple-container-com/go-embedb v0.0.0-20261125014124-4fd517a5b3e3
 
 require (
 	github.com/FerretDB/FerretDB v0.0.0-20261123155907-155d9eb7d9e0
