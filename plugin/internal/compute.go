@@ -100,10 +100,15 @@ func NewProcessor(cfg ProcessorConfig) *Processor {
 //     with the retry policy from design doc §P3. Best-effort — see the
 //     comment at the call site.
 //
-// Called for a client.yaml service with `uses: [my-notifier]`, and — since
-// SC core gained `uses:` on Components — for a sibling component with the
-// same line. The two paths are indistinguishable from here, which is the
-// point: there is one consumer contract, not two.
+// Called for a client.yaml service with `uses: [my-notifier]`. The same
+// line on a sibling COMPONENT is designed for and will route here
+// unchanged — the two paths are deliberately indistinguishable from this
+// function, because there is one consumer contract, not two — but it does
+// NOT work yet: `uses` is absent from `api.ComponentConfigTopLevelKeys`,
+// so writing it on a component is still a parse-time error. The core
+// change is simple-container-com/api#643, open as of 2026-11-24. Do not
+// read the symmetry below as evidence the component path is live; the
+// only consumer this has ever been reached by is a client stack.
 //
 // The signing key is read from the plugin's own Provision inputs
 // (`signingKey`); for the notifier's purposes we expect the test harness to
