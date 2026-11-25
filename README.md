@@ -234,6 +234,58 @@ failure mode is silent rather than loud:
   list as the allowed-top-level-keys check — a binding whose key is not
   allowlisted is refused at parse time and can never fire.
 
+## Operator config
+
+Everything derivable is derived from `deployTo:`. What is left is what only
+the operator can decide — which template, which hostname, which credentials,
+which channels:
+
+```yaml
+my-notifier:
+  type: sc-notifier
+  config:
+    deployTo: lambda
+    ingress:
+      hostname: notify.example.com
+    storage: notifier-data              # name of another SC resource
+    signingKey:       "${secret:notifier-signing-key}"
+    operatorPassword: "${secret:notifier-operator-password}"
+    schedulerToken:   "${secret:notifier-scheduler-token}"
+    channels:
+      - name: ops-telegram
+        type: telegram
+        token:  "${secret:ops-telegram-bot-token}"
+        chatId: "${secret:ops-telegram-chat-id}"
+        minSeverity: warning
+```
+
+Derived from `deployTo: lambda`:
+
+| Derived | Value |
+|---|---|
+| `image` | `simplecontainer/sc-component-notifier:<this plugin's version>` — the plugin and the image are released together off one CalVer tag, so pinning the plugin pins the image |
+| `maxMemory` / `timeout` | `512` / `30` — measured, not SC's 128 default |
+| `cloudExtras.lambdaRoutingType` | `function-url` (the APIGW path mounts the lambda under a stage named `api`, and a SPA serving its own routes 404s on every one) |
+| `cloudExtras.awsRoles` | the five S3 verbs on the component's own bucket, and nothing else — a notifier reads no logs, no metrics and no infrastructure |
+| `cloudExtras.lambdaSchedules` | the `nt-tick` rule, `rate(1 minute)`, presenting your `schedulerToken` |
+| `storage.type` | `s3` |
+| `env.STORAGE_*`, `NOTIFIER_SELF_URL`, `NOTIFIER_CHANNELS`, `NOTIFIER_COOLDOWN` | from your `storage:`, `ingress:` and `channels:` blocks |
+| `env.USE_GOEMBEDB` / `GOEMBEDB_S3_BUCKET` | `1`, and the same bucket under its own prefix |
+
+**Overriding any of them is one key in `config:`** — operator wins per key.
+Two cautions. A list value is taken **wholesale**, not merged, so writing
+your own `awsRoles` replaces the component's set rather than adding to it.
+And `storage:` has two shapes that do not agree: a bare
+`storage: notifier-data` grows a `--<env>` suffix, while
+`storage: {bucket: notifier-data}` is taken verbatim.
+
+The `nt-tick` schedule in particular used to be a ~30-line block every
+operator pasted by hand, because an early failure was read as "SC cannot
+resolve `${resource:...}` inside a schedule payload". It can; the `$sc:`
+sentinel just has to be at **position 0 of the payload** rather than beside
+the token. See `schedulerTickRequest` in
+`plugin/cmd/sc-component-notifier/main.go`.
+
 ## Running tests
 
 ```
@@ -255,12 +307,14 @@ no external services.
   service) needs an `api` core change and is not in a release yet — see
   `forge/docs/design/2026-11-23/component-uses-wiring/`. Until it lands,
   only a deploying service can be a consumer.
-- go-embedb adoption is **code-complete, not shipped**: the store, the
-  Lambda no-bucket boot guard and the `migrationToken:` secret wire are
-  on `main`, but `USE_GOEMBEDB` is `0` on the deployed service, so
-  nothing has executed any of it on staging. The flip (plus
-  `GOEMBEDB_S3_BUCKET`, plus scheduling the empty-store window) is an
-  operator action.
+- go-embedb is **shipped and live** on `notify.simple-forge.com`. It is
+  no longer an operator action either: `USE_GOEMBEDB: "1"` and
+  `GOEMBEDB_S3_BUCKET` are component defaults, the bucket derived from
+  the operator's own `storage:` block so the two cannot disagree. The
+  colocated S3 store it replaced served read-modify-write upserts only
+  from whichever warm execution environment held the lease and answered
+  `NotWritablePrimary(10107)` from every other one — in a service whose
+  job is a queue, that means dropped notifications.
 - **No publisher has sent a real event yet.** The tenants table reads
   `count: 0`; the end-to-end smoke (force a backup failure, assert the
   Telegram message, assert the `Delivery` row) is still owed.
